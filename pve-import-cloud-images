@@ -1,0 +1,673 @@
+#!/bin/bash
+set -euo pipefail
+
+# pve-import-cloud-images - Import upstream cloud images as Proxmox VE templates
+#
+# Scans distribution mirrors to discover the latest cloud images, optionally
+# customizes them (e.g. installing qemu-guest-agent), and imports them as
+# PVE templates ready for cloning and cloud-init deployment.
+#
+# Supported distributions (last two releases each, discovered dynamically):
+#   Debian, Ubuntu LTS, Rocky Linux, openSUSE Leap, Oracle Linux, FreeBSD
+#
+# Workflow per image:
+#   1. Scan public mirrors for available versions
+#   2. Download cloud image (cached in /var/tmp/pve-cloud-images/)
+#   3. Optionally inject qemu-guest-agent via virt-customize
+#   4. Create VM shell with EFI, cloud-init, and serial console
+#   5. Import disk and attach to SCSI bus
+#   6. Convert VM to template
+#
+# Reference: https://iriarte.it/datacenter/2025/02/13/PVE-Cloud-Images.html
+
+VERSION="1.0.0"
+
+# --- Colors (disabled when stdout is not a terminal) --------------------------
+if [[ -t 1 ]]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_CYAN='\033[0;36m'
+    C_BOLD='\033[1m'
+    C_RESET='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+fi
+
+# --- Helpers ------------------------------------------------------------------
+msg()  { echo -e "${C_BOLD}${C_CYAN}::${C_RESET} $*"; }
+ok()   { echo -e "   ${C_GREEN}[+]${C_RESET} $*"; }
+warn() { echo -e "   ${C_YELLOW}[!]${C_RESET} $*"; }
+err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
+
+DRY_RUN=0
+ERRORS=0
+
+run() {
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} $*"
+    else
+        "$@"
+    fi
+}
+
+# --- Defaults -----------------------------------------------------------------
+FORCE=0
+STORAGE="local-lvm"
+BRIDGE="vmbr0"
+DISK_FORMAT="raw"
+DISK_SIZE=""
+START_ID=9000
+CACHE_DIR="/var/tmp/pve-cloud-images"
+CUSTOMIZE=1
+MODE=""
+DISTRO_FILTER=""
+MAX_VERSIONS=2
+
+# --- Image catalog (populated dynamically by mirror discovery) ----------------
+declare -a IMG_KEY=() IMG_NAME=() IMG_URL=() IMG_FAMILY=() IMG_CUSTOMIZE=()
+IMG_COUNT=0
+
+_reg() {
+    IMG_KEY+=("$1"); IMG_NAME+=("$2"); IMG_URL+=("$3")
+    IMG_FAMILY+=("$4"); IMG_CUSTOMIZE+=("${5:-}")
+    (( IMG_COUNT++ )) || true
+}
+
+# --- HTTP / HTML utilities ----------------------------------------------------
+fetch_page() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        curl -sfL --max-time 15 "$url" 2>/dev/null
+    elif command -v wget &>/dev/null; then
+        wget -qO- --timeout=15 "$url" 2>/dev/null
+    fi
+}
+
+# Extract href values from HTML, one per line, trailing slashes stripped
+extract_hrefs() {
+    grep -o 'href="[^"]*"' | sed 's/href="//;s/"$//;s|/$||;s|^\./||'
+}
+
+# --- Mirror discovery functions -----------------------------------------------
+# Each outputs lines of: KEY|NAME|URL|FAMILY|CUSTOMIZE
+# Sorted newest-first, limited to $MAX_VERSIONS entries.
+
+discover_debian() {
+    local base="https://cdimage.debian.org/images/cloud"
+    local page
+    page=$(fetch_page "$base/") || return 1
+
+    # Codename directories: pure lowercase alpha, skip sid, deduplicate
+    local codenames
+    codenames=$(echo "$page" | extract_hrefs | grep -xE '[a-z]+' | grep -vE '^sid$' | sort -u)
+
+    local entries=()
+    for codename in $codenames; do
+        local listing filename ver
+        listing=$(fetch_page "$base/$codename/latest/") || continue
+        # Prefer 'generic' variant (supports cloud-init + direct boot)
+        filename=$(echo "$listing" | extract_hrefs \
+            | grep -E '^debian-[0-9]+-generic-amd64\.qcow2$' | head -1)
+        if [[ -z "$filename" ]]; then
+            filename=$(echo "$listing" | extract_hrefs \
+                | grep -E '^debian-[0-9]+-genericcloud-amd64\.qcow2$' | head -1)
+        fi
+        [[ -n "$filename" ]] || continue
+        ver=$(echo "$filename" | sed 's/debian-\([0-9]*\).*/\1/')
+        entries+=("${ver}|${codename}|${filename}")
+    done
+
+    printf '%s\n' "${entries[@]}" | sort -t'|' -k1 -rn | head -"$MAX_VERSIONS" \
+    | while IFS='|' read -r ver codename filename; do
+        echo "debian-${ver}|Debian ${ver} (${codename})|${base}/${codename}/latest/${filename}|debian|guest-agent"
+    done
+}
+
+discover_ubuntu() {
+    local base="https://cloud-images.ubuntu.com/releases"
+    local page
+    page=$(fetch_page "$base/") || return 1
+
+    # Extract version directories, filter to LTS (even year + .04)
+    local versions
+    versions=$(echo "$page" | extract_hrefs \
+        | grep -xE '[0-9]+\.[0-9]+' \
+        | awk -F. '$2=="04" && $1%2==0' \
+        | sort -Vr | head -"$MAX_VERSIONS")
+
+    for ver in $versions; do
+        local listing filename
+        listing=$(fetch_page "$base/$ver/release/") || continue
+        filename=$(echo "$listing" | extract_hrefs \
+            | grep -E "^ubuntu-${ver}(\.[0-9]+)?-server-cloudimg-amd64\.img$" \
+            | sort -V | tail -1)
+        [[ -n "$filename" ]] || continue
+        local key_ver=${ver//.}
+        echo "ubuntu-${key_ver}|Ubuntu ${ver} LTS|${base}/${ver}/release/${filename}|ubuntu|guest-agent"
+    done
+}
+
+discover_rocky() {
+    local base="https://dl.rockylinux.org/pub/rocky"
+    local page
+    page=$(fetch_page "$base/") || return 1
+
+    local versions
+    versions=$(echo "$page" | extract_hrefs | grep -xE '[0-9]+' | sort -rn | head -"$MAX_VERSIONS")
+
+    for ver in $versions; do
+        local listing filename
+        listing=$(fetch_page "$base/$ver/images/x86_64/") || continue
+        # Prefer .latest. symlink
+        filename=$(echo "$listing" | extract_hrefs \
+            | grep -E "^Rocky-${ver}-GenericCloud-LVM\.latest\.x86_64\.qcow2$" | head -1)
+        if [[ -z "$filename" ]]; then
+            filename=$(echo "$listing" | extract_hrefs \
+                | grep -E "^Rocky-${ver}-GenericCloud-LVM-.*\.x86_64\.qcow2$" \
+                | sort -V | tail -1)
+        fi
+        [[ -n "$filename" ]] || continue
+        echo "rocky-${ver}|Rocky Linux ${ver}|${base}/${ver}/images/x86_64/${filename}|rocky|"
+    done
+}
+
+
+discover_opensuse() {
+    local base="https://download.opensuse.org/distribution/leap"
+    local page
+    page=$(fetch_page "$base/") || return 1
+
+    # Extract Leap version directories (skip 42.x legacy series)
+    local versions
+    versions=$(echo "$page" | extract_hrefs \
+        | sed -n 's|^[0-9]*\.[0-9]*$|&|p' \
+        | awk -F. '$1 >= 15 && $1 < 42' \
+        | sort -Vr)
+
+    local found=0
+    for ver in $versions; do
+        (( found >= MAX_VERSIONS )) && break
+        local listing filename=""
+        listing=$(fetch_page "$base/$ver/appliances/") || continue
+        # Cloud variant (cloud-init support); naming differs between 15.x and 16.x
+        for pattern in \
+            "openSUSE-Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2" \
+            "Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2"; do
+            filename=$(echo "$listing" | extract_hrefs | grep -F "$pattern" | head -1)
+            [[ -n "$filename" ]] && break
+        done
+        [[ -n "$filename" ]] || continue
+        echo "opensuse-${ver}|openSUSE Leap ${ver}|${base}/${ver}/appliances/${filename}|opensuse|ptp-fix"
+        (( found++ )) || true
+    done
+}
+
+discover_oracle() {
+    local base="https://yum.oracle.com"
+    local found=0
+
+    for major in 10 9 8; do
+        (( found >= MAX_VERSIONS )) && break
+        local json
+        json=$(fetch_page "$base/templates/OracleLinux/ol${major}-template.json") || continue
+
+        # Parse KVM qcow2 filename from JSON (no jq dependency)
+        local filename
+        filename=$(echo "$json" | grep -o '"OL[0-9]*U[0-9]*_x86_64-kvm-b[0-9]*\.qcow2"' | tr -d '"' | head -1)
+        [[ -n "$filename" ]] || continue
+
+        local basepath
+        basepath=$(echo "$json" | grep -o '"/templates/OracleLinux/OL'"$major"'/[^"]*"' | tr -d '"' | head -1)
+        [[ -n "$basepath" ]] || continue
+
+        local update
+        update=$(echo "$filename" | sed 's/OL[0-9]*U\([0-9]*\).*/\1/')
+
+        echo "oracle-${major}|Oracle Linux ${major}.${update}|${base}${basepath}/${filename}|oracle|"
+        (( found++ )) || true
+    done
+}
+
+discover_freebsd() {
+    local base="https://download.freebsd.org/releases/VM-IMAGES"
+    local page
+    page=$(fetch_page "$base/") || return 1
+
+    # Only RELEASE directories, skip ALPHA/BETA/RC
+    local versions
+    versions=$(echo "$page" | extract_hrefs \
+        | sed -n 's/-RELEASE$//p' \
+        | grep -xE '[0-9]+\.[0-9]+' \
+        | sort -Vr | head -"$MAX_VERSIONS")
+
+    for ver in $versions; do
+        local listing filename
+        listing=$(fetch_page "$base/${ver}-RELEASE/amd64/Latest/") || continue
+        # BASIC-CLOUDINIT with UFS (cloud-init ready, xz-compressed)
+        filename=$(echo "$listing" | extract_hrefs \
+            | grep -F "FreeBSD-${ver}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" | head -1)
+        [[ -n "$filename" ]] || continue
+        echo "freebsd-${ver}|FreeBSD ${ver}|${base}/${ver}-RELEASE/amd64/Latest/${filename}|freebsd|"
+    done
+}
+
+# --- Build catalog from mirrors (parallel) ------------------------------------
+build_catalog() {
+    local families tmpdir
+    if [[ -n "$DISTRO_FILTER" ]]; then
+        families=("$DISTRO_FILTER")
+    else
+        families=(debian ubuntu rocky opensuse oracle freebsd)
+    fi
+
+    tmpdir=$(mktemp -d)
+
+    msg "Scanning distribution mirrors..."
+
+    for family in "${families[@]}"; do
+        # Disable strict mode in discovery subshells: grep returns 1 on no-match
+        # which is expected when probing mirrors for available images.
+        ( set +eo pipefail; discover_"${family}" ) > "$tmpdir/$family" 2>/dev/null &
+    done
+    wait
+
+    for family in "${families[@]}"; do
+        if [[ -s "$tmpdir/$family" ]]; then
+            local count=0
+            while IFS='|' read -r key name url fam customize; do
+                [[ -n "$url" ]] || continue
+                _reg "$key" "$name" "$url" "$fam" "$customize"
+                (( count++ )) || true
+            done < "$tmpdir/$family"
+            ok "${family}: ${count} image(s)"
+        else
+            warn "${family}: no images found"
+        fi
+    done
+    echo
+
+    rm -rf "$tmpdir"
+}
+
+# --- Dependency checks --------------------------------------------------------
+check_fetch_deps() {
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        err "wget or curl is required for mirror scanning."
+        exit 1
+    fi
+}
+
+check_import_deps() {
+    local missing=()
+    for cmd in qm qemu-img; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        err "Missing required commands: ${missing[*]}"
+        exit 1
+    fi
+    if (( CUSTOMIZE )); then
+        if ! command -v virt-customize &>/dev/null; then
+            warn "virt-customize not found — image customization disabled"
+            warn "Install libguestfs-tools for guest-agent injection"
+            CUSTOMIZE=0
+        fi
+    fi
+}
+
+# --- VMID helpers -------------------------------------------------------------
+vmid_exists() {
+    qm status "$1" &>/dev/null 2>&1 || pct status "$1" &>/dev/null 2>&1
+}
+
+# --- Download -----------------------------------------------------------------
+download_image() {
+    local url="$1" dest="$2"
+    if [[ -f "$dest" ]]; then
+        ok "Cached: $(basename "$dest")"
+        return 0
+    fi
+    msg "Downloading $(basename "$dest")..."
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} download → $(basename "$dest")"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress -O "${dest}.part" "$url" || {
+            rm -f "${dest}.part"; return 1
+        }
+    else
+        curl -fL --progress-bar -o "${dest}.part" "$url" || {
+            rm -f "${dest}.part"; return 1
+        }
+    fi
+    mv "${dest}.part" "$dest"
+}
+
+# --- Customize ----------------------------------------------------------------
+customize_image() {
+    local image="$1" action="$2"
+    (( CUSTOMIZE )) || return 0
+    [[ -n "$action" ]] || return 0
+    case "$action" in
+        guest-agent)
+            msg "Injecting qemu-guest-agent..."
+            run virt-customize -a "$image" --install qemu-guest-agent
+            ;;
+        ptp-fix)
+            msg "Enabling ptp_kvm module..."
+            run virt-customize -a "$image" \
+                --write /etc/modules-load.d/ptp_kvm.conf:ptp_kvm
+            ;;
+    esac
+}
+
+# --- Import a single image as template ----------------------------------------
+import_single() {
+    local idx="$1"
+    local key="${IMG_KEY[$idx]}"
+    local name="${IMG_NAME[$idx]}"
+    local url="${IMG_URL[$idx]}"
+    local customize="${IMG_CUSTOMIZE[$idx]}"
+    local vmid=$(( START_ID + idx + 1 ))
+    local tpl_name="cloud-${key}"
+    local filename work_image
+    filename=$(basename "$url")
+
+    msg "Importing ${C_BOLD}${name}${C_RESET} → ${tpl_name} (VMID ${vmid})"
+
+    # Check for collision
+    if vmid_exists "$vmid"; then
+        if (( FORCE )); then
+            warn "VMID ${vmid} exists — destroying (--force)"
+            run qm destroy "$vmid" --purge 2>/dev/null || true
+        else
+            warn "VMID ${vmid} exists — skipping (use --force to replace)"
+            return 0
+        fi
+    fi
+
+    # Download
+    download_image "$url" "${CACHE_DIR}/${filename}" || {
+        err "Download failed: ${name}"; return 1
+    }
+
+    # Decompress xz-compressed images (e.g. FreeBSD)
+    local image_file="${CACHE_DIR}/${filename}"
+    if [[ "$filename" == *.xz ]]; then
+        local decompressed="${image_file%.xz}"
+        if [[ ! -f "$decompressed" ]]; then
+            msg "Decompressing $(basename "$filename")..."
+            if (( DRY_RUN )); then
+                echo -e "   ${C_YELLOW}[dry-run]${C_RESET} xz -dk ${image_file}"
+            else
+                xz -dk "$image_file"
+            fi
+        else
+            ok "Cached: $(basename "$decompressed")"
+        fi
+        image_file="$decompressed"
+    fi
+
+    # Working copy (so the cache stays pristine)
+    work_image="${CACHE_DIR}/${key}.work.qcow2"
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} cp ${image_file} ${work_image}"
+    else
+        cp "$image_file" "$work_image"
+    fi
+
+    # Customize (guest-agent, ptp_kvm, etc.)
+    customize_image "$work_image" "$customize"
+
+    # Resize boot disk (optional)
+    if [[ -n "$DISK_SIZE" ]]; then
+        msg "Resizing disk → ${DISK_SIZE}"
+        run qemu-img resize "$work_image" "$DISK_SIZE"
+    fi
+
+    # Create VM shell (no disks — they're added in later steps)
+    local ostype="l26"
+    [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]] && ostype="other"
+
+    run qm create "$vmid" --name "$tpl_name" \
+        --cores 2 --memory 2048 \
+        --net0 "virtio,firewall=1,bridge=${BRIDGE}" \
+        --scsihw virtio-scsi-pci \
+        --bios ovmf --machine q35 \
+        --agent enabled=1 --ostype "$ostype" \
+        --cpu cputype=max \
+        --serial0 socket --vga serial0
+
+    # Import cloud image disk into PVE storage.
+    # This is the first disk operation on a fresh VM, so the imported disk
+    # will be disk-0.  EFI and cloud-init are added afterwards.
+    msg "Importing disk → ${STORAGE} (format: ${DISK_FORMAT})"
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm importdisk ${vmid} ${work_image} ${STORAGE} --format ${DISK_FORMAT}"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm set ${vmid} --scsi0 ${STORAGE}:vm-${vmid}-disk-0,discard=on,ssd=1"
+    else
+        local import_out
+        import_out=$(qm importdisk "$vmid" "$work_image" "$STORAGE" \
+                     --format "$DISK_FORMAT" 2>&1) || {
+            err "Disk import failed for ${name}"
+            qm destroy "$vmid" --purge 2>/dev/null || true
+            rm -f "$work_image"
+            return 1
+        }
+        echo "$import_out" | tail -1
+
+        # Parse volume reference from:
+        #   Successfully imported disk as 'unused0:STORAGE:vm-VMID-disk-N'
+        local disk_ref
+        disk_ref=$(echo "$import_out" \
+                   | sed -n "s/.*'unused[0-9]*:\(.*\)'.*/\1/p" | tail -1)
+        if [[ -z "$disk_ref" ]]; then
+            err "Could not parse imported disk reference"
+            qm destroy "$vmid" --purge 2>/dev/null || true
+            rm -f "$work_image"
+            return 1
+        fi
+        qm set "$vmid" --scsi0 "${disk_ref},discard=on,ssd=1"
+    fi
+
+    # EFI disk (OVMF)
+    run qm set "$vmid" --efidisk0 "${STORAGE}:0,efitype=4m"
+
+    # Cloud-init drive (on IDE to avoid SCSI bus numbering issues)
+    run qm set "$vmid" --ide2 "${STORAGE}:cloudinit"
+
+    # Boot order
+    run qm set "$vmid" --boot order=scsi0
+
+    # Seal as template
+    run qm template "$vmid"
+
+    # Clean up working copy (keep cached download)
+    rm -f "$work_image"
+
+    ok "Template ${C_BOLD}${tpl_name}${C_RESET} (VMID ${vmid}) ready"
+}
+
+# --- Catalog display ----------------------------------------------------------
+list_catalog() {
+    if (( IMG_COUNT == 0 )); then
+        err "No images discovered."
+        exit 1
+    fi
+    printf "\n  ${C_BOLD}%-4s  %-16s  %-28s  %s${C_RESET}\n" "#" "KEY" "NAME" "VMID"
+    printf "  %-4s  %-16s  %-28s  %s\n" "---" "----------------" "----------------------------" "----"
+    for (( i=0; i<IMG_COUNT; i++ )); do
+        printf "  %-4d  %-16s  %-28s  %d\n" \
+            $(( i + 1 )) "${IMG_KEY[$i]}" "${IMG_NAME[$i]}" $(( START_ID + i + 1 ))
+    done
+    echo
+}
+
+# --- Interactive selection ----------------------------------------------------
+interactive_select() {
+    list_catalog
+    echo -e "  ${C_BOLD}Select images (space-separated numbers," \
+            "${C_CYAN}a${C_RESET}${C_BOLD}=all," \
+            "${C_CYAN}q${C_RESET}${C_BOLD}=quit):${C_RESET}"
+    read -r -p "  > " selection
+
+    case "$selection" in
+        q|Q) echo "Aborted."; exit 0 ;;
+        a|A)
+            for (( i=0; i<IMG_COUNT; i++ )); do
+                SELECTED+=("$i")
+            done
+            return
+            ;;
+    esac
+
+    for num in $selection; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= IMG_COUNT )); then
+            SELECTED+=("$(( num - 1 ))")
+        else
+            warn "Invalid selection: $num"
+        fi
+    done
+
+    if (( ${#SELECTED[@]} == 0 )); then
+        err "No valid images selected."
+        exit 1
+    fi
+}
+
+# --- Usage / Help -------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Import upstream cloud images as Proxmox VE templates.
+
+Images are discovered dynamically from distribution mirrors.  The last
+$MAX_VERSIONS releases are offered for each distribution family.
+
+Modes:
+  -i, --interactive     Select images interactively (default on TTY)
+  -b, --batch           Import all discovered images non-interactively
+  -l, --list            List discovered images and exit
+
+Options:
+  -s, --storage NAME    Target storage (default: local-lvm)
+  -B, --bridge NAME     Network bridge (default: vmbr0)
+  -f, --format FMT      Disk format: raw, qcow2 (default: raw)
+  -S, --disk-size SIZE  Resize boot disk (e.g. 60G; default: keep original)
+  -I, --start-id ID     Starting VM ID (default: 9000)
+  -d, --distro NAME     Filter by family: debian ubuntu rocky opensuse oracle freebsd
+      --force           Replace existing templates with same VMID
+      --no-customize    Skip virt-customize (guest-agent injection, etc.)
+  -n, --dry-run         Show what would be done without making changes
+  -h, --help            Show this help message
+  -v, --version         Show version
+
+Examples:
+  $(basename "$0") -i                     Interactive selection
+  $(basename "$0") -b                     Import all discovered images
+  $(basename "$0") -b -d debian           Debian images only
+  $(basename "$0") -b -s ceph-pool        Use specific storage backend
+  $(basename "$0") -b -S 60G              Resize disks to 60G
+  $(basename "$0") -l                     List available images
+  $(basename "$0") -n -b                  Dry run, all images
+EOF
+}
+
+# --- Main ---------------------------------------------------------------------
+main() {
+    declare -a SELECTED=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)         usage; exit 0 ;;
+            --version|-v)      echo "pve-import-cloud-images $VERSION"; exit 0 ;;
+            --interactive|-i)  MODE="interactive"; shift ;;
+            --batch|-b)        MODE="batch"; shift ;;
+            --list|-l)         MODE="list"; shift ;;
+            --storage|-s)      STORAGE="$2"; shift 2 ;;
+            --bridge|-B)       BRIDGE="$2"; shift 2 ;;
+            --format|-f)       DISK_FORMAT="$2"; shift 2 ;;
+            --disk-size|-S)    DISK_SIZE="$2"; shift 2 ;;
+            --start-id|-I)     START_ID="$2"; shift 2 ;;
+            --distro|-d)       DISTRO_FILTER="$2"; shift 2 ;;
+            --force)           FORCE=1; shift ;;
+            --no-customize)    CUSTOMIZE=0; shift ;;
+            --dry-run|-n)      DRY_RUN=1; shift ;;
+            -*)                err "Unknown option: $1"; usage; exit 1 ;;
+            *)                 err "Unexpected argument: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    # Auto-detect mode
+    if [[ -z "$MODE" ]]; then
+        [[ -t 0 && -t 1 ]] && MODE="interactive" || MODE="batch"
+    fi
+
+    # Validate distro filter
+    if [[ -n "$DISTRO_FILTER" ]]; then
+        case "$DISTRO_FILTER" in
+            debian|ubuntu|rocky|opensuse|oracle|freebsd) ;;
+            *) err "Unknown distro family: $DISTRO_FILTER"; exit 1 ;;
+        esac
+    fi
+
+    # Discovery needs network tools
+    check_fetch_deps
+
+    # Discover images from mirrors (parallel)
+    build_catalog
+
+    # List mode (no root / PVE tools needed)
+    if [[ "$MODE" == "list" ]]; then
+        list_catalog
+        exit 0
+    fi
+
+    # Import modes need root and PVE tools (dry-run can skip these)
+    if (( ! DRY_RUN )); then
+        if [[ $EUID -ne 0 ]]; then
+            err "This script must be run as root."
+            exit 1
+        fi
+        check_import_deps
+    fi
+
+    # Build selection
+    case "$MODE" in
+        interactive) interactive_select ;;
+        batch)
+            for (( i=0; i<IMG_COUNT; i++ )); do
+                SELECTED+=("$i")
+            done
+            ;;
+    esac
+
+    if (( ${#SELECTED[@]} == 0 )); then
+        err "No images to import."
+        exit 1
+    fi
+
+    (( DRY_RUN )) && echo -e "${C_YELLOW}=== DRY RUN MODE ===${C_RESET}\n"
+
+    msg "Importing ${#SELECTED[@]} image(s)..."
+    echo
+
+    for idx in "${SELECTED[@]}"; do
+        import_single "$idx" || (( ERRORS++ )) || true
+        echo
+    done
+
+    if (( ERRORS )); then
+        err "${ERRORS} image(s) failed."
+        exit 1
+    else
+        msg "Done. All templates imported successfully."
+    fi
+}
+
+main "$@"
