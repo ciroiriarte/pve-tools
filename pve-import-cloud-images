@@ -214,36 +214,43 @@ discover_opensuse() {
         (( found >= MAX_VERSIONS )) && break
         local url=""
 
-        # Prefer NoCloud variant from Cloud:Images repo (designed for local
-        # cloud-init datasources like PVE's config drive).
-        local ci_base="https://download.opensuse.org/repositories/Cloud:/Images:/Leap_${ver}/images"
-        local ci_listing
-        ci_listing=$(fetch_page "$ci_base/") 2>/dev/null || true
-        if [[ -n "$ci_listing" ]]; then
-            local ci_filename
+        # Prefer Cloud variant from distribution/leap appliances — this
+        # path is served by the main mirror network and downloads reliably.
+        # The Cloud:Images OBS repo (/repositories/Cloud:/Images:/) uses a
+        # separate mirror tree where TLS and availability are unreliable.
+        local listing filename=""
+        listing=$(fetch_page "$base/$ver/appliances/") 2>/dev/null || true
+        if [[ -n "$listing" ]]; then
             # Prefer versioned filename (with Build suffix) — mirrors may
             # not carry the short symlink that the origin server lists.
-            ci_filename=$(echo "$ci_listing" | extract_hrefs \
-                | grep -E 'x86_64-.*-NoCloud-Build.*\.qcow2$' | head -1)
-            if [[ -z "$ci_filename" ]]; then
-                ci_filename=$(echo "$ci_listing" | extract_hrefs \
-                    | grep -F "x86_64-NoCloud.qcow2" | grep -v '\.sha256' | head -1)
+            filename=$(echo "$listing" | extract_hrefs \
+                | grep -E "x86_64-.*Cloud-Build.*\.qcow2$" | grep -v 'encrypt\|xen' | head -1)
+            if [[ -z "$filename" ]]; then
+                for pattern in \
+                    "openSUSE-Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2" \
+                    "Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2"; do
+                    filename=$(echo "$listing" | extract_hrefs | grep -F "$pattern" | head -1)
+                    [[ -n "$filename" ]] && break
+                done
             fi
-            [[ -n "$ci_filename" ]] && url="${ci_base}/${ci_filename}"
+            [[ -n "$filename" ]] && url="${base}/${ver}/appliances/${filename}"
         fi
 
-        # Fall back to Cloud variant from distribution/leap appliances
+        # Fall back to NoCloud variant from Cloud:Images OBS repo
         if [[ -z "$url" ]]; then
-            local listing filename=""
-            listing=$(fetch_page "$base/$ver/appliances/") || continue
-            for pattern in \
-                "openSUSE-Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2" \
-                "Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2"; do
-                filename=$(echo "$listing" | extract_hrefs | grep -F "$pattern" | head -1)
-                [[ -n "$filename" ]] && break
-            done
-            [[ -n "$filename" ]] || continue
-            url="${base}/${ver}/appliances/${filename}"
+            local ci_base="https://download.opensuse.org/repositories/Cloud:/Images:/Leap_${ver}/images"
+            local ci_listing
+            ci_listing=$(fetch_page "$ci_base/") 2>/dev/null || true
+            if [[ -n "$ci_listing" ]]; then
+                local ci_filename
+                ci_filename=$(echo "$ci_listing" | extract_hrefs \
+                    | grep -E 'x86_64-.*-NoCloud-Build.*\.qcow2$' | head -1)
+                if [[ -z "$ci_filename" ]]; then
+                    ci_filename=$(echo "$ci_listing" | extract_hrefs \
+                        | grep -F "x86_64-NoCloud.qcow2" | grep -v '\.sha256' | head -1)
+                fi
+                [[ -n "$ci_filename" ]] && url="${ci_base}/${ci_filename}"
+            fi
         fi
 
         echo "opensuse-${ver}|openSUSE Leap ${ver}|${url}|opensuse|ptp-fix"
