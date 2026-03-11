@@ -166,6 +166,15 @@ pve-vmnic-fix --all
 pve-vmnic-fix --dry-run --all
 ```
 
+Reports per-interface status and prints a summary:
+
+```
+:: Fixing vm 100
+   Checking net0 (bridge: vmbr0)...
+   [+] net0 OK
+:: Done. 1 guest(s), 1 interface(s) checked, 0 repaired.
+```
+
 ---
 
 ## Installation

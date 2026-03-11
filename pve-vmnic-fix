@@ -20,7 +20,7 @@ set -euo pipefail
 # Supports both firewall-enabled NICs (fwbr/fwpr/fwln chain) and direct
 # tap/veth connections.
 
-VERSION="1.1.0"
+VERSION="1.0.0"
 
 # --- Colors (disabled when stdout is not a terminal) --------------------------
 if [[ -t 1 ]]; then
@@ -42,6 +42,9 @@ err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
 
 DRY_RUN=0
 ERRORS=0
+GUESTS_CHECKED=0
+IFACES_CHECKED=0
+IFACES_REPAIRED=0
 
 run() {
     if (( DRY_RUN )); then
@@ -94,6 +97,7 @@ fix_guest() {
         return 1
     fi
 
+    (( GUESTS_CHECKED++ ))
     msg "Fixing $TYPE $ID"
 
     # Extract net lines
@@ -119,19 +123,22 @@ fix_guest() {
         local FWBR="fwbr${ID}i${IDX}"
 
         local TARGET_IF=""
+        local repaired=0
+
+        (( IFACES_CHECKED++ ))
 
         # CASE A: Firewall ENABLED (intermediary bridges)
         if ip link show "$FWPR" >/dev/null 2>&1; then
-            echo -e "   ${C_CYAN}[Firewall: ON]${C_RESET} Repairing link pair..."
             run ip link set "$FWPR" up
             run ip link set "$FWLN" up
             run ip link set "$FWBR" up 2>/dev/null || true
 
             local CURRENT_MASTER
-            CURRENT_MASTER=$(bridge link show dev "$FWPR" 2>/dev/null | awk '{print $3}')
+            CURRENT_MASTER=$(bridge link show dev "$FWPR" 2>/dev/null | grep -oP 'master \K\S+')
             if [[ "$CURRENT_MASTER" != "$BRIDGE" ]]; then
                 run ip link set "$FWPR" master "$BRIDGE"
                 ok "Plugged $FWPR into $BRIDGE"
+                repaired=1
             fi
 
             # Bounce the firewall bridge to clear LOWERLAYERDOWN
@@ -144,14 +151,14 @@ fix_guest() {
 
         # CASE B: Firewall DISABLED (direct connection)
         elif ip link show "$TAP_IF" >/dev/null 2>&1; then
-            echo -e "   ${C_CYAN}[Firewall: OFF]${C_RESET} Repairing direct tap..."
             run ip link set "$TAP_IF" up
 
             local CURRENT_MASTER
-            CURRENT_MASTER=$(bridge link show dev "$TAP_IF" 2>/dev/null | awk '{print $3}')
+            CURRENT_MASTER=$(bridge link show dev "$TAP_IF" 2>/dev/null | grep -oP 'master \K\S+')
             if [[ "$CURRENT_MASTER" != "$BRIDGE" ]]; then
                 run ip link set "$TAP_IF" master "$BRIDGE"
                 ok "Plugged $TAP_IF into $BRIDGE"
+                repaired=1
             fi
             TARGET_IF="$TAP_IF"
         else
@@ -168,21 +175,27 @@ fix_guest() {
             ok "EVPN MAC $VM_MAC re-announced."
         fi
 
+        if (( repaired )); then
+            (( IFACES_REPAIRED++ ))
+        else
+            ok "net${IDX} OK"
+        fi
+
     done <<< "$NET_CONFIGS"
 }
 
 # --- Collect all running guest IDs --------------------------------------------
-all_running_ids() {
-    local ids=()
+# Populates the IDS array in the caller via nameref.
+collect_running_ids() {
+    local -n _out=$1
     # Running VMs (QEMU)
     while IFS= read -r vmid; do
-        [[ -n "$vmid" ]] && ids+=("$vmid")
+        [[ -n "$vmid" ]] && _out+=("$vmid")
     done < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}')
     # Running CTs (LXC)
     while IFS= read -r ctid; do
-        [[ -n "$ctid" ]] && ids+=("$ctid")
+        [[ -n "$ctid" ]] && _out+=("$ctid")
     done < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')
-    echo "${ids[@]}"
 }
 
 # --- Main ---------------------------------------------------------------------
@@ -203,7 +216,7 @@ main() {
     done
 
     if (( ALL )); then
-        IDS=( $(all_running_ids) )
+        collect_running_ids IDS
         if [[ ${#IDS[@]} -eq 0 ]]; then
             echo "No running VMs or CTs found."
             exit 0
@@ -230,10 +243,10 @@ main() {
 
     echo ""
     if (( ERRORS )); then
-        err "$ERRORS guest(s) had errors."
+        err "Done. ${GUESTS_CHECKED} guest(s), ${IFACES_CHECKED} interface(s) checked, ${IFACES_REPAIRED} repaired, ${ERRORS} error(s)."
         exit 1
     else
-        msg "Done. All guests processed successfully."
+        msg "Done. ${GUESTS_CHECKED} guest(s), ${IFACES_CHECKED} interface(s) checked, ${IFACES_REPAIRED} repaired."
     fi
 }
 
