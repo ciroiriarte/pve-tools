@@ -442,6 +442,14 @@ customize_image() {
     [[ -n "$action" ]] || return 0
     case "$action" in
         guest-agent)
+            if [[ "$family" == "freebsd" ]]; then
+                # FreeBSD UFS cannot be mounted by libguestfs (Linux has
+                # read-only UFS2 support only) and FreeBSD uses nuageinit
+                # (not cloud-init) so vendor-data directives aren't available.
+                # Instructions are added to the template's VM notes instead.
+                msg "FreeBSD: guest-agent must be installed manually (see VM notes)"
+                return 0
+            fi
             msg "Injecting qemu-guest-agent..."
             # libguestfs SLIRP networking uses 169.254.0.0/16 (not the
             # traditional 10.0.2.0/24).  The appliance does not bring up
@@ -451,14 +459,8 @@ customize_image() {
             # separate virt-customize operations.
             # /etc/resolv.conf may be a dangling symlink (systemd-resolved),
             # so we force-create it via run-command and clean up afterwards.
-            if [[ "$family" == "freebsd" ]]; then
-                # FreeBSD uses ifconfig(8) and pkg(8)
-                run virt-customize --network -a "$image" \
-                    --run-command 'ifconfig vtnet0 inet 169.254.2.15 netmask 255.255.0.0 up; route add default 169.254.2.2; echo nameserver 169.254.2.3 > /etc/resolv.conf; pkg install -y qemu-guest-agent; sysrc qemu_guest_agent_enable=YES; rm -f /etc/resolv.conf'
-            else
-                run virt-customize --network -a "$image" \
-                    --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
-            fi
+            run virt-customize --network -a "$image" \
+                --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
             ;;
         ptp-fix)
             msg "Enabling ptp_kvm module..."
@@ -466,6 +468,28 @@ customize_image() {
                 --write /etc/modules-load.d/ptp_kvm.conf:ptp_kvm
             ;;
     esac
+}
+
+# Add a VM description/notes with guest-agent install instructions for
+# FreeBSD templates.  libguestfs cannot mount UFS2 (Linux kernel only
+# supports read-only), and FreeBSD uses nuageinit instead of cloud-init
+# so vendor-data package directives are not available.
+set_freebsd_agent_notes() {
+    local vmid="$1"
+    local notes
+    notes=$(printf '%s\n' \
+        "FreeBSD cloud template." \
+        "" \
+        "Install QEMU guest agent after first boot (as root):" \
+        "  pkg install -y qemu-guest-agent" \
+        "  sysrc qemu_guest_agent_enable=YES" \
+        "  service qemu-guest-agent start")
+    if (( API_MODE )); then
+        pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+            "description=${notes}" &>/dev/null || true
+    else
+        qm set "$vmid" --description "$notes" &>/dev/null || true
+    fi
 }
 
 # --- Import a single image as template (local mode) ---------------------------
@@ -589,6 +613,11 @@ import_single_local() {
 
     # Boot order
     run qm set "$vmid" --boot order=scsi0
+
+    # FreeBSD: add guest-agent install instructions to VM notes
+    if [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]]; then
+        set_freebsd_agent_notes "$vmid"
+    fi
 
     # Seal as template
     run qm template "$vmid"
@@ -797,6 +826,11 @@ import_single_api() {
         upid=$(echo "$response" | pve_extract_upid)
         [[ -z "$upid" ]] || pve_wait_task "$upid" 60 || { err "Template conversion failed"; return 1; }
         ok "Template sealed"
+    fi
+
+    # FreeBSD: add guest-agent install instructions to VM notes
+    if [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]]; then
+        set_freebsd_agent_notes "$vmid"
     fi
 
     # Clean up import image from storage
