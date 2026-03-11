@@ -460,14 +460,24 @@ download_image() {
     mkdir -p "$(dirname "$dest")"
     # Prefer curl (consistent with fetch_page) — some mirror redirects
     # with percent-encoded paths are handled differently by wget.
-    if command -v curl &>/dev/null; then
-        curl -fL --progress-bar -o "${dest}.part" "$url" || {
-            rm -f "${dest}.part"; return 1
-        }
-    elif command -v wget &>/dev/null; then
-        wget -q --show-progress -O "${dest}.part" "$url" || {
-            rm -f "${dest}.part"; return 1
-        }
+    # Retry up to 3 times: openSUSE MirrorCache may route to a mirror
+    # with transient TLS or connectivity issues.
+    local attempt rc=1
+    for attempt in 1 2 3; do
+        if (( attempt > 1 )); then
+            warn "Retry ${attempt}/3: $(basename "$dest")"
+            rm -f "${dest}.part"
+            sleep 2
+        fi
+        if command -v curl &>/dev/null; then
+            curl -fL --progress-bar -o "${dest}.part" "$url" && { rc=0; break; }
+        elif command -v wget &>/dev/null; then
+            wget -q --show-progress -O "${dest}.part" "$url" && { rc=0; break; }
+        fi
+    done
+    if (( rc )); then
+        rm -f "${dest}.part"
+        return 1
     fi
     mv "${dest}.part" "$dest"
 }
