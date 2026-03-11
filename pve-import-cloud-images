@@ -20,7 +20,7 @@ set -euo pipefail
 #
 # Reference: https://iriarte.it/datacenter/2025/02/13/PVE-Cloud-Images.html
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # --- Colors (disabled when stdout is not a terminal) --------------------------
 if [[ -t 1 ]]; then
@@ -42,6 +42,20 @@ err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
 
 DRY_RUN=0
 ERRORS=0
+DISCOVERY_TMPDIR=""
+
+cleanup() {
+    # Remove partial downloads
+    if [[ -d "$CACHE_DIR" ]]; then
+        rm -f "$CACHE_DIR"/*.part
+        rm -f "$CACHE_DIR"/*.work.qcow2
+    fi
+    # Remove mirror-discovery scratch directory
+    if [[ -n "$DISCOVERY_TMPDIR" && -d "$DISCOVERY_TMPDIR" ]]; then
+        rm -rf "$DISCOVERY_TMPDIR"
+    fi
+}
+trap cleanup EXIT
 
 run() {
     if (( DRY_RUN )); then
@@ -207,8 +221,14 @@ discover_opensuse() {
         ci_listing=$(fetch_page "$ci_base/") 2>/dev/null || true
         if [[ -n "$ci_listing" ]]; then
             local ci_filename
+            # Prefer versioned filename (with Build suffix) — mirrors may
+            # not carry the short symlink that the origin server lists.
             ci_filename=$(echo "$ci_listing" | extract_hrefs \
-                | grep -F "x86_64-NoCloud.qcow2" | grep -v '\.sha256' | head -1)
+                | grep -E 'x86_64-.*-NoCloud-Build.*\.qcow2$' | head -1)
+            if [[ -z "$ci_filename" ]]; then
+                ci_filename=$(echo "$ci_listing" | extract_hrefs \
+                    | grep -F "x86_64-NoCloud.qcow2" | grep -v '\.sha256' | head -1)
+            fi
             [[ -n "$ci_filename" ]] && url="${ci_base}/${ci_filename}"
         fi
 
@@ -282,32 +302,32 @@ discover_freebsd() {
 
 # --- Build catalog from mirrors (parallel) ------------------------------------
 build_catalog() {
-    local families tmpdir
+    local families
     if [[ -n "$DISTRO_FILTER" ]]; then
         families=("$DISTRO_FILTER")
     else
         families=(debian ubuntu rocky opensuse oracle freebsd)
     fi
 
-    tmpdir=$(mktemp -d)
+    DISCOVERY_TMPDIR=$(mktemp -d)
 
     msg "Scanning distribution mirrors..."
 
     for family in "${families[@]}"; do
         # Disable strict mode in discovery subshells: grep returns 1 on no-match
         # which is expected when probing mirrors for available images.
-        ( set +eo pipefail; discover_"${family}" ) > "$tmpdir/$family" 2>/dev/null &
+        ( set +eo pipefail; discover_"${family}" ) > "$DISCOVERY_TMPDIR/$family" 2>/dev/null &
     done
     wait
 
     for family in "${families[@]}"; do
-        if [[ -s "$tmpdir/$family" ]]; then
+        if [[ -s "$DISCOVERY_TMPDIR/$family" ]]; then
             local count=0
             while IFS='|' read -r key name url fam customize; do
                 [[ -n "$url" ]] || continue
                 _reg "$key" "$name" "$url" "$fam" "$customize"
                 (( count++ )) || true
-            done < "$tmpdir/$family"
+            done < "$DISCOVERY_TMPDIR/$family"
             ok "${family}: ${count} image(s)"
         else
             warn "${family}: no images found"
@@ -315,7 +335,8 @@ build_catalog() {
     done
     echo
 
-    rm -rf "$tmpdir"
+    rm -rf "$DISCOVERY_TMPDIR"
+    DISCOVERY_TMPDIR=""
 }
 
 # --- Dependency checks --------------------------------------------------------
@@ -437,12 +458,14 @@ download_image() {
         return 0
     fi
     mkdir -p "$(dirname "$dest")"
-    if command -v wget &>/dev/null; then
-        wget -q --show-progress -O "${dest}.part" "$url" || {
+    # Prefer curl (consistent with fetch_page) — some mirror redirects
+    # with percent-encoded paths are handled differently by wget.
+    if command -v curl &>/dev/null; then
+        curl -fL --progress-bar -o "${dest}.part" "$url" || {
             rm -f "${dest}.part"; return 1
         }
-    else
-        curl -fL --progress-bar -o "${dest}.part" "$url" || {
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress -O "${dest}.part" "$url" || {
             rm -f "${dest}.part"; return 1
         }
     fi
