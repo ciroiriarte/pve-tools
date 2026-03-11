@@ -27,17 +27,17 @@ Dynamically scans distribution mirrors to discover the latest releases — no ha
 # List what's available (no root needed)
 pve-import-cloud-images --list
 
-# Interactive selection (default on TTY)
-pve-import-cloud-images
+# Interactive selection (local mode on a PVE node)
+pve-import-cloud-images --mode local
 
 # Import all images
-pve-import-cloud-images --batch
+pve-import-cloud-images --mode local --batch
 
 # Import only Debian templates to a specific storage
-pve-import-cloud-images --batch --distro debian --storage ceph-pool
+pve-import-cloud-images --mode local --batch --distro debian --storage ceph-pool
 
 # Preview without making changes
-pve-import-cloud-images --dry-run --batch
+pve-import-cloud-images --mode local --dry-run --batch
 ```
 
 **Per-image workflow:**

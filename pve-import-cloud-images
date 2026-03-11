@@ -1020,16 +1020,16 @@ Execution mode:
                            VM disks are stored on --storage as usual.
 
 Examples:
-  $(basename "$0") -i                     Interactive selection
-  $(basename "$0") -b                     Import all discovered images
-  $(basename "$0") -b -d debian           Debian images only
-  $(basename "$0") -b -s ceph-pool        Use specific storage backend
-  $(basename "$0") -b -S 60G              Resize disks to 60G
-  $(basename "$0") -l                     List available images
-  $(basename "$0") -n -b                  Dry run, all images
+  $(basename "$0") -l                     List available images (no --mode needed)
+  $(basename "$0") -m local -i            Interactive selection
+  $(basename "$0") -m local -b            Import all discovered images
+  $(basename "$0") -m local -b -d debian  Debian images only
+  $(basename "$0") -m local -b -s pool    Use specific storage backend
+  $(basename "$0") -m local -b -S 60G     Resize disks to 60G
+  $(basename "$0") -m local -n -b         Dry run, all images
 
   # API mode (remote):
-  $(basename "$0") --mode api --api-host https://pve:8006 \\
+  $(basename "$0") -m api --api-host https://pve:8006 \\
       --api-node pve1 --api-token 'user@pam!token=secret' -b -d debian
 EOF
 }
