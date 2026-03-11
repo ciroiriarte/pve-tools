@@ -657,7 +657,7 @@ import_single_api() {
     # Skip xz-compressed images (e.g. FreeBSD) in API mode
     if [[ "$filename" == *.xz ]]; then
         warn "Skipping ${name}: .xz compressed images not supported in API mode"
-        warn "Use local mode (without --api) for this image"
+        warn "Use --mode local for this image"
         return 0
     fi
 
@@ -930,8 +930,10 @@ Options:
   -h, --help            Show this help message
   -v, --version         Show version
 
-API mode (run remotely against a PVE cluster, requires PVE 8.4+):
-      --api                Enable API mode (all PVE operations via REST API)
+Execution mode:
+  -m, --mode MODE        Execution mode: local (default) or api
+                           local — run directly on a PVE node (uses qm commands)
+                           api   — run remotely via REST API (requires PVE 8.4+)
       --api-host URL       PVE API URL (e.g. https://pve.example.com:8006)
       --api-node NAME      PVE node name (e.g. pve1)
       --api-token TOKEN    API token: user@realm!tokenid=secret
@@ -950,7 +952,7 @@ Examples:
   $(basename "$0") -n -b                  Dry run, all images
 
   # API mode (remote):
-  $(basename "$0") --api --api-host https://pve:8006 \\
+  $(basename "$0") --mode api --api-host https://pve:8006 \\
       --api-node pve1 --api-token 'user@pam!token=secret' -b -d debian
 EOF
 }
@@ -977,7 +979,13 @@ main() {
             --no-customize)    CUSTOMIZE=0; shift ;;
             --dry-run|-n)      DRY_RUN=1; shift ;;
             --arch)            ARCH="$2"; shift 2 ;;
-            --api)             API_MODE=1; shift ;;
+            --mode|-m)
+                case "$2" in
+                    local) API_MODE=0 ;;
+                    api)   API_MODE=1 ;;
+                    *)     err "Unknown mode: $2 (must be 'local' or 'api')"; exit 1 ;;
+                esac
+                shift 2 ;;
             --api-host)        API_HOST="$2"; shift 2 ;;
             --api-node)        API_NODE="$2"; shift 2 ;;
             --api-token)       API_TOKEN="$2"; shift 2 ;;
@@ -1043,7 +1051,7 @@ main() {
     # Import modes need root and PVE tools (dry-run can skip these)
     if (( ! DRY_RUN )); then
         if (( ! API_MODE )) && [[ $EUID -ne 0 ]]; then
-            err "This script must be run as root (or use --api for remote mode)."
+            err "This script must be run as root (or use --mode api for remote mode)."
             exit 1
         fi
         check_import_deps
