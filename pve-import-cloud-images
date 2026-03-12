@@ -516,11 +516,17 @@ customize_image() {
             # so we force-create it via run-command and clean up afterwards.
             run virt-customize --network -a "$image" \
                 --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
+            # virt-customize populates /etc/machine-id; reset it so each
+            # clone gets a unique ID on first boot.
+            run virt-customize -a "$image" --truncate /etc/machine-id
             ;;
         ptp-fix)
             msg "Enabling ptp_kvm module..."
             run virt-customize -a "$image" \
                 --write /etc/modules-load.d/ptp_kvm.conf:ptp_kvm
+            # virt-customize populates /etc/machine-id; reset it so each
+            # clone gets a unique ID on first boot.
+            run virt-customize -a "$image" --truncate /etc/machine-id
             ;;
     esac
 }
