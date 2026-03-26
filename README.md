@@ -43,9 +43,10 @@ pve-import-cloud-images --mode local --dry-run --batch
 **Per-image workflow:**
 
 1. Download cloud image (cached in `/var/tmp/pve-cloud-images/`)
-2. Optionally inject `qemu-guest-agent` via `virt-customize`
-3. Create VM with EFI, virtio-scsi, serial console, cloud-init drive
-4. Import disk and convert to template
+2. Probe image for precise OS version via `virt-cat` (e.g. Debian 12 → 12.13)
+3. Optionally inject `qemu-guest-agent` via `virt-customize`
+4. Create VM with EFI, virtio-scsi, serial console, cloud-init drive
+5. Import disk and convert to template
 
 **EL10 / x86-64-v3 requirement:**
 
