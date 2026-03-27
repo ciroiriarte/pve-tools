@@ -33,10 +33,14 @@
 #
 # Supported base distributions: Rocky Linux, Ubuntu LTS, openSUSE Leap.
 #
+# All VM interaction uses the QEMU guest agent (virtio serial channel) —
+# no SSH or network connectivity required between PVE host and build VM.
+# The ISO is extracted from the stopped VM's disk via virt-copy-out.
+#
 # Prerequisites (on the PVE host):
 #   - Proxmox VE 8.x or later
-#   - libguestfs-tools  (virt-customize, virt-cat)
-#   - ssh-keygen, ssh, scp
+#   - libguestfs-tools  (virt-customize, virt-cat, virt-copy-out)
+#   - python3 (for parsing guest agent JSON responses)
 #   - A cloud-init template with qemu-guest-agent installed
 #
 # See --help for full usage.
@@ -85,7 +89,6 @@ OUTPUT_DIR=""                # where to write the ISO (default: $PWD)
 RESCUE_ONLY=0                # 1 = mkrescue (no backup), 0 = mkbackup
 REAR_TIMEOUT=1800            # max seconds for rear build (30 min)
 BOOT_TIMEOUT=180             # max seconds to wait for guest agent
-SSH_TIMEOUT=120              # max seconds to wait for SSH
 
 # Target-host network (embedded in the ISO, applied after restore)
 BOND_MODE="802.3ad"          # bonding mode
@@ -101,15 +104,14 @@ VM_VLAN=""                   # optional VLAN tag on the VM NIC
 VM_NET_IP="dhcp"             # "dhcp" or static IP/MASK (e.g. 10.0.0.50/24)
 VM_NET_GW=""                 # gateway (required when VM_NET_IP is static)
 VM_NET_DNS=""                # DNS     (required when VM_NET_IP is static)
+VM_PROXY=""                  # HTTP proxy for build VM (package downloads)
 
 # Internal state (set during execution)
 TEMP_VMID=""
 TEMP_DIR=""
-SSH_KEY_FILE=""
 DISK_PATH=""
 DISTRO_FAMILY=""
 DISTRO_VERSION=""
-VM_IP=""
 
 # --- Cleanup ------------------------------------------------------------------
 
@@ -190,11 +192,6 @@ generate_files() {
     if [[ -n "$NETMASK" ]]; then
         generate_target_network_conf > "$TEMP_DIR/target-network.conf"
     fi
-
-    # ---- temporary SSH keypair -----------------------------------------------
-    SSH_KEY_FILE="$TEMP_DIR/tshoot-key"
-    ssh-keygen -t ed25519 -f "$SSH_KEY_FILE" -N "" -q
-    ok "Temporary SSH keypair generated"
 
     # ---- ReaR local.conf -----------------------------------------------------
     generate_rear_conf > "$TEMP_DIR/rear-local.conf"
@@ -502,6 +499,25 @@ inject_files() {
     # ReaR local.conf
     vc+=( --upload "$TEMP_DIR/rear-local.conf:/etc/rear/local.conf" )
 
+    # ---- enable guest-exec in the QEMU guest agent ---------------------------
+    # Cloud images ship with an allow-list that excludes guest-exec.
+    # We need it for package installation and running ReaR without SSH.
+    # Clear the filter so all RPCs are allowed (this is a temp build VM).
+    # Add guest-exec and guest-exec-status to the guest agent allow-list.
+    # Cloud images ship with an allow-list that excludes exec RPCs.
+    vc+=( --run-command "if grep -q '^FILTER_RPC_ARGS=.*--allow-rpcs=' /etc/sysconfig/qemu-ga 2>/dev/null; then \
+        sed -i 's/--allow-rpcs=\\(.*\\)\"/--allow-rpcs=\\1,guest-exec,guest-exec-status\"/' /etc/sysconfig/qemu-ga; \
+    elif [ -f /etc/sysconfig/qemu-ga ]; then \
+        sed -i 's/^FILTER_RPC_ARGS=.*/FILTER_RPC_ARGS=\"--allow-rpcs=guest-ping,guest-info,guest-sync,guest-sync-delimited,guest-exec,guest-exec-status,guest-network-get-interfaces,guest-get-osinfo,guest-shutdown,guest-get-host-name\"/' /etc/sysconfig/qemu-ga; \
+    fi || true" )
+    vc+=( --run-command "mkdir -p /etc/qemu" )
+
+    # ---- set SELinux to permissive for the build VM --------------------------
+    # On RHEL/Rocky, SELinux confines the guest agent to virt_qemu_ga_t which
+    # blocks command execution and file writes.  Permissive mode allows
+    # guest-exec to work.  This only affects the build VM, not the final ISO.
+    vc+=( --run-command "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true" )
+
     # ---- wipe host identity --------------------------------------------------
     # Each restored system must regenerate unique IDs on first boot.
     vc+=( --run-command 'truncate -s 0 /etc/machine-id 2>/dev/null || true' )
@@ -515,71 +531,161 @@ inject_files() {
     ok "File injection complete"
 }
 
-# --- Online package installation (via SSH on the running VM) ------------------
+# --- Online package installation (via guest agent) ----------------------------
 
-# Install packages inside the running VM via SSH.  Called after cloud-init
-# has grown the filesystem and network is available.
+# Install packages inside the running VM via qm guest exec.  Called after
+# cloud-init has grown the filesystem and network is available.
 install_packages() {
     local major="${DISTRO_VERSION%%.*}"
 
     msg "Installing packages ($DISTRO_FAMILY $DISTRO_VERSION)..."
 
-    # Wait for cloud-init AND any background package manager to finish.
-    # cloud-init may report "done" while a spawned zypper/apt/dnf is still running.
-    vm_ssh "cloud-init status --wait 2>/dev/null || true; \
-        while pgrep -x 'zypper|dnf|apt-get|dpkg' &>/dev/null; do sleep 5; done" < /dev/null
+    # Wait for cloud-init AND background package managers to finish.
+    # Poll instead of running a long-lived command — the guest agent may
+    # restart during cloud-init, killing any in-flight guest-exec.
+    msg "Waiting for cloud-init to finish..."
+    local ci_attempts=0
+    while (( ci_attempts < 60 )); do
+        local ci_out
+        ci_out=$(vm_exec 15 "cloud-init status 2>/dev/null; pgrep -x 'zypper|dnf|apt-get|dpkg' > /dev/null && echo PKG_RUNNING || echo PKG_IDLE" 2>/dev/null) || {
+            # Agent might have restarted — wait and retry
+            sleep 10
+            wait_for_agent "$TEMP_VMID" 60 || true
+            (( ci_attempts++ )) || true
+            continue
+        }
+        if echo "$ci_out" | grep -q 'done\|error' && echo "$ci_out" | grep -q 'PKG_IDLE'; then
+            break
+        fi
+        sleep 10
+        (( ci_attempts++ )) || true
+    done
+    ok "Cloud-init complete"
 
-    case "$DISTRO_FAMILY" in
-        rocky)
-            # Upload nic-xray repo file
-            cat > "$TEMP_DIR/nic-xray.repo" <<REPO_EOF
+    # Configure HTTP proxy in the build VM if --vm-proxy is specified.
+    if [[ -n "$VM_PROXY" ]]; then
+        ok "Build-VM proxy: $VM_PROXY"
+        vm_exec 30 "
+            echo 'proxy=${VM_PROXY}' >> /etc/dnf/dnf.conf 2>/dev/null
+            printf 'Acquire::http::Proxy \"${VM_PROXY}\";\nAcquire::https::Proxy \"${VM_PROXY}\";\n' > /etc/apt/apt.conf.d/99proxy 2>/dev/null
+            mkdir -p /etc/sysconfig 2>/dev/null
+            printf 'PROXY_ENABLED=\"yes\"\nHTTP_PROXY=\"${VM_PROXY}\"\nHTTPS_PROXY=\"${VM_PROXY}\"\n' >> /etc/sysconfig/proxy 2>/dev/null
+            true
+        " > /dev/null 2>&1 || true
+    fi
+
+    # Build install script in TEMP_DIR, write it to the VM, then execute.
+    # This avoids quoting/length issues with qm guest exec.
+    local install_script="$TEMP_DIR/vm-install.sh"
+    {
+        echo '#!/bin/bash'
+        # Ensure full PATH — guest agent may run with a restricted PATH
+        echo 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        # Redirect all output to a log file inside the VM — the guest agent
+        # response buffer cannot handle large package manager output.
+        echo 'exec > /var/log/tshoot-install.log 2>&1'
+        # Do NOT use set -e — package managers may return non-zero for
+        # non-fatal warnings (e.g. zypper exit 106 = repos skipped).
+        # Each critical command is checked explicitly with || exit 1.
+        # Proxy env (if set)
+        [[ -n "$VM_PROXY" ]] && cat <<PROXY_EOF
+export http_proxy=${VM_PROXY}
+export https_proxy=${VM_PROXY}
+export HTTP_PROXY=${VM_PROXY}
+export HTTPS_PROXY=${VM_PROXY}
+PROXY_EOF
+
+        case "$DISTRO_FAMILY" in
+            rocky)
+                cat <<ROCKY_EOF
+cat > /etc/yum.repos.d/nic-xray.repo << 'REPO'
 [home_ciriarte_network-tools]
 name=Network Tools (home:ciriarte:network-tools)
 baseurl=https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Rocky_${major}/
 enabled=1
 gpgcheck=0
 type=rpm-md
-REPO_EOF
-            scp -i "$SSH_KEY_FILE" \
-                -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                "$TEMP_DIR/nic-xray.repo" "root@${VM_IP}:/etc/yum.repos.d/nic-xray.repo" 2>/dev/null
-            vm_ssh "dnf install -y epel-release && dnf install -y rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage" < /dev/null || \
-                die "Package installation failed on Rocky"
-            # ReaR 2.6 (EPEL) does not support GRUB2-BLS (default on EL9+)
-            if (( major >= 9 )); then
-                vm_ssh "echo 'BOOTLOADER=GRUB2-EFI' >> /etc/rear/local.conf" < /dev/null
-            fi
-            ;;
+REPO
+dnf install -y epel-release || exit 1
+dnf install -y rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage || exit 1
+ROCKY_EOF
+                if (( major >= 9 )); then
+                    echo "echo 'BOOTLOADER=GRUB2-EFI' >> /etc/rear/local.conf"
+                fi
+                ;;
+            ubuntu)
+                local ub_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Ubuntu_${DISTRO_VERSION}"
+                cat <<UBUNTU_EOF
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq || exit 1
+apt-get install -y -qq curl gnupg || exit 1
+mkdir -p /etc/apt/keyrings
+curl -fsSL "${ub_repo}/Release.key" | gpg --dearmor -o /etc/apt/keyrings/nic-xray.gpg || exit 1
+echo "deb [signed-by=/etc/apt/keyrings/nic-xray.gpg] ${ub_repo}/ /" > /etc/apt/sources.list.d/nic-xray.list
+apt-get update -qq || exit 1
+apt-get install -y -qq -o Dpkg::Options::="--force-confold" rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage || exit 1
+UBUNTU_EOF
+                ;;
+            opensuse)
+                local suse_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/openSUSE_Leap_${DISTRO_VERSION}"
+                local suse_archiving="https://download.opensuse.org/repositories/Archiving/${DISTRO_VERSION}"
+                cat <<SUSE_EOF
+zypper addrepo --no-gpgcheck "${suse_repo}/" nic-xray 2>/dev/null || true
+zypper --gpg-auto-import-keys --no-gpg-checks refresh 2>/dev/null || true
+zypper -n --no-gpg-checks install lldpd tcpdump nic-xray dmidecode efibootmgr xorriso 2>/dev/null || true
+zypper -n --no-gpg-checks install "${suse_archiving}/x86_64/rear-2.9-archiving.91.1.x86_64.rpm" 2>/dev/null || zypper -n --no-gpg-checks install rear 2>/dev/null || true
+# Verify critical packages installed — zypper exit codes are unreliable
+command -v rear > /dev/null || { echo "FATAL: rear not installed"; exit 1; }
+command -v tcpdump > /dev/null || { echo "FATAL: tcpdump not installed"; exit 1; }
+command -v lldpd > /dev/null || { echo "FATAL: lldpd not installed"; exit 1; }
+SUSE_EOF
+                ;;
+        esac
 
-        ubuntu)
-            local ub_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Ubuntu_${DISTRO_VERSION}"
-            vm_ssh "export DEBIAN_FRONTEND=noninteractive; \
-                apt-get update -qq && \
-                apt-get install -y -qq curl gnupg && \
-                mkdir -p /etc/apt/keyrings && \
-                curl -fsSL '${ub_repo}/Release.key' | gpg --dearmor -o /etc/apt/keyrings/nic-xray.gpg && \
-                echo 'deb [signed-by=/etc/apt/keyrings/nic-xray.gpg] ${ub_repo}/ /' > /etc/apt/sources.list.d/nic-xray.list && \
-                apt-get update -qq && \
-                apt-get install -y -qq rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage" < /dev/null || \
-                die "Package installation failed on Ubuntu"
-            ;;
+        echo 'systemctl enable lldpd 2>/dev/null || true'
+    } > "$install_script"
 
-        opensuse)
-            local suse_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/openSUSE_Leap_${DISTRO_VERSION}"
-            local suse_archiving="https://download.opensuse.org/repositories/Archiving/${DISTRO_VERSION}"
-            # nic-xray from OBS repo, rear from Archiving (installed via URL to
-            # avoid zypper repo metadata issues with OBS repositories)
-            vm_ssh "zypper addrepo --no-gpgcheck '${suse_repo}/' nic-xray || true; \
-                zypper --gpg-auto-import-keys --no-gpg-checks refresh || true; \
-                zypper -n --no-gpg-checks install lldpd tcpdump nic-xray dmidecode efibootmgr xorriso || true; \
-                zypper -n --no-gpg-checks install '${suse_archiving}/x86_64/rear-2.9-archiving.91.1.x86_64.rpm' || \
-                zypper -n --no-gpg-checks install rear" < /dev/null || \
-                warn "Some packages may not have installed cleanly (zypper exit code non-zero)"
-            ;;
-    esac
+    # Write the install script into the VM via guest agent.
+    # Re-check agent availability — cloud-init may restart the agent service.
+    wait_for_agent "$TEMP_VMID" 60 || die "Guest agent lost during package setup"
 
-    # Enable lldpd
-    vm_ssh "systemctl enable lldpd 2>/dev/null || true" < /dev/null
+    local script_b64
+    script_b64=$(base64 -w0 "$install_script")
+    vm_exec 10 "echo '${script_b64}' | base64 -d > /tmp/install.sh; chmod +x /tmp/install.sh" > /dev/null 2>&1 || \
+        die "Failed to write install script to VM"
+
+    # Execute the install script in the background inside the VM.
+    # Long-running guest-exec calls are unreliable (agent restarts, buffer
+    # overflows, timeouts).  Instead: start in background, poll for completion.
+    vm_exec 10 "nohup bash -c 'bash /tmp/install.sh; echo \$? > /tmp/install.exitcode' > /dev/null 2>&1 &" > /dev/null 2>&1 || true
+
+    local elapsed=0 install_status=""
+    while (( elapsed < REAR_TIMEOUT )); do
+        sleep 15
+        (( elapsed += 15 )) || true
+        install_status=$(vm_exec 10 "cat /tmp/install.exitcode 2>/dev/null" 2>/dev/null) || {
+            # Agent might have restarted — retry after wait
+            wait_for_agent "$TEMP_VMID" 30 || true
+            continue
+        }
+        install_status=$(echo "$install_status" | tr -d '[:space:]')
+        [[ -n "$install_status" ]] && break
+    done
+
+    if [[ "$install_status" != "0" ]]; then
+        err "Package installation failed (exit code: ${install_status:-timeout})"
+        err "Last 20 lines from VM install log:"
+        vm_exec 10 "tail -20 /var/log/tshoot-install.log 2>/dev/null" >&2 || true
+        case "$DISTRO_FAMILY" in
+            opensuse) warn "Continuing despite install warnings" ;;
+            *)        die "Package installation failed on $DISTRO_FAMILY" ;;
+        esac
+    fi
+
+    # Remove build-VM proxy config so it doesn't leak into the ISO
+    if [[ -n "$VM_PROXY" ]]; then
+        vm_exec 10 "sed -i '/^proxy=/d' /etc/dnf/dnf.conf 2>/dev/null; rm -f /etc/apt/apt.conf.d/99proxy 2>/dev/null; sed -i '/PROXY/d' /etc/sysconfig/proxy 2>/dev/null; true" > /dev/null 2>&1 || true
+    fi
 
     ok "Package installation complete"
 }
@@ -625,53 +731,32 @@ wait_for_agent() {
     return 1
 }
 
-# Extract the first non-loopback IPv4 address from the guest agent.
-get_vm_ip() {
-    local vmid="$1"
-    local json
+# Run a command inside the VM via the QEMU guest agent (virtio serial).
+# No network connectivity required between host and VM.
+# Usage: vm_exec TIMEOUT_SECS "command string"
+vm_exec() {
+    local timeout="$1"; shift
+    local cmd="$*"
+    local result qm_rc=0
 
-    json=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null) || return 1
+    result=$(qm guest exec "$TEMP_VMID" --timeout "$timeout" -- bash -c "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $cmd" 2>&1) || qm_rc=$?
 
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r '
-            [ .[] | select(.name != "lo")
-              | (."ip-addresses" // [])[]
-              | select(."ip-address-type" == "ipv4")
-              | ."ip-address" ] | first // empty'
-    else
-        # Fallback: basic regex extraction
-        echo "$json" \
-            | grep -oP '"ip-address"\s*:\s*"\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-            | grep -v '^127\.' | head -1
+    # If qm itself failed (agent unreachable, timeout), there's no JSON to parse
+    if ! echo "$result" | grep -q '"exitcode"'; then
+        err "Guest agent error (qm exit $qm_rc): $result"
+        return 1
     fi
-}
 
-# Retry SSH until the guest accepts connections with the temp key.
-wait_for_ssh() {
-    local ip="$1" key="$2" timeout="${3:-$SSH_TIMEOUT}"
-    local elapsed=0
-
-    while (( elapsed < timeout )); do
-        ssh -i "$key" \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=5 \
-            -o BatchMode=yes \
-            "root@${ip}" true &>/dev/null 2>&1 && return 0
-        sleep 5
-        (( elapsed += 5 ))
-    done
-    return 1
-}
-
-# SSH wrapper for the temporary VM.
-vm_ssh() {
-    ssh -i "$SSH_KEY_FILE" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o BatchMode=yes \
-        -o ConnectTimeout=30 \
-        "root@${VM_IP}" "$@"
+    # Parse the JSON response — PVE 9.x returns plain-text out-data/err-data
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for key, fd in [('out-data', sys.stdout), ('err-data', sys.stderr)]:
+    v = d.get(key, '')
+    if v:
+        print(v, end='', file=fd)
+sys.exit(d.get('exitcode', 1))
+" <<< "$result"
 }
 
 # --- Remote mode (delegation) -------------------------------------------------
@@ -715,6 +800,7 @@ delegate_to_server() {
     [[ "$VM_NET_IP" != "dhcp" ]] && rcmd+=( --vm-ip "$VM_NET_IP" )
     [[ -n "$VM_NET_GW" ]]    && rcmd+=( --vm-gateway "$VM_NET_GW" )
     [[ -n "$VM_NET_DNS" ]]   && rcmd+=( --vm-dns "$VM_NET_DNS" )
+    [[ -n "$VM_PROXY" ]]     && rcmd+=( --vm-proxy "$VM_PROXY" )
     # Flags
     (( RESCUE_ONLY )) && rcmd+=( --rescue-only )
     (( DRY_RUN ))     && rcmd+=( --dry-run )
@@ -833,7 +919,7 @@ ${C_BOLD}Target-host network${C_RESET} (applied on physical hosts after restore)
       --netmask MASK       Network mask (e.g. /24 or 255.255.255.0)
       --gateway GW         Default gateway
       --dns SERVERS        Comma-separated DNS servers
-      --proxy URL          HTTP/HTTPS proxy
+      --proxy URL          HTTP/HTTPS proxy for restored hosts
 
   If --netmask, --gateway, and --dns are all provided, a management
   interface is configured automatically on each restored host using the
@@ -845,6 +931,7 @@ ${C_BOLD}Build-VM network${C_RESET} (used during image preparation):
       --vm-ip IP/MASK      Build VM IP (default: dhcp)
       --vm-gateway GW      Build VM gateway (required if --vm-ip is static)
       --vm-dns DNS         Build VM DNS    (optional for static)
+      --vm-proxy URL       HTTP/HTTPS proxy for build VM (package downloads)
 
 ${C_BOLD}General:${C_RESET}
   -s, --storage STORE      PVE storage for temp VM          [local-lvm]
@@ -916,6 +1003,7 @@ main() {
             --vm-ip)          VM_NET_IP="$2";      shift 2 ;;
             --vm-gateway)     VM_NET_GW="$2";      shift 2 ;;
             --vm-dns)         VM_NET_DNS="$2";     shift 2 ;;
+            --vm-proxy)       VM_PROXY="$2";       shift 2 ;;
             # --- info ---
             -h|--help)        usage;               exit 0  ;;
             -v|--version)     echo "pve-create-tshoot-image $VERSION"; exit 0 ;;
@@ -948,7 +1036,7 @@ main() {
         die "Local mode requires root on a PVE host (or use -S user@host for remote mode)"
     fi
 
-    for cmd in qm pvesm pvesh virt-customize virt-cat ssh-keygen ssh scp; do
+    for cmd in qm pvesm pvesh virt-customize virt-cat virt-copy-out python3; do
         command -v "$cmd" &>/dev/null || die "Required command not found: $cmd"
     done
 
@@ -994,9 +1082,6 @@ main() {
     ok "Disk resized"
 
     # ==== STEP 5: inject configuration files (offline, lightweight) ==========
-    # Only file injection here — no package installation (avoids virt-resize
-    # and SLIRP networking complexity).  Packages are installed via SSH after
-    # the VM boots and cloud-init has grown the filesystem.
     inject_files "$DISK_PATH"
 
     # ==== STEP 6: configure build-VM networking + start VM =====================
@@ -1007,17 +1092,14 @@ main() {
     [[ -n "$VM_VLAN" ]] && net0_spec+=",tag=${VM_VLAN}"
     qm set "$TEMP_VMID" --net0 "$net0_spec"
 
-    # Cloud-init: SSH key + IP config
+    # Cloud-init: IP config (no SSH key needed — we use guest agent)
     local ipconfig0
     if [[ "$VM_NET_IP" == "dhcp" ]]; then
         ipconfig0="ip=dhcp"
     else
         ipconfig0="ip=${VM_NET_IP},gw=${VM_NET_GW}"
     fi
-    qm set "$TEMP_VMID" \
-        --ciuser root \
-        --sshkeys "${SSH_KEY_FILE}.pub" \
-        --ipconfig0 "$ipconfig0"
+    qm set "$TEMP_VMID" --ciuser root --ipconfig0 "$ipconfig0"
 
     # Set DNS via cloud-init when using static IP
     if [[ "$VM_NET_IP" != "dhcp" && -n "$VM_NET_DNS" ]]; then
@@ -1032,33 +1114,14 @@ main() {
     msg "Starting temporary VM ${TEMP_VMID}..."
     qm start "$TEMP_VMID"
 
-    # ==== STEP 7: wait for guest agent + SSH ==================================
+    # ==== STEP 7: wait for guest agent ========================================
     msg "Waiting for guest agent (timeout: ${BOOT_TIMEOUT}s)..."
     if ! wait_for_agent "$TEMP_VMID" "$BOOT_TIMEOUT"; then
         die "Guest agent did not respond within ${BOOT_TIMEOUT}s"
     fi
     ok "Guest agent ready"
 
-    # Give cloud-init a moment to finish SSH key injection
-    sleep 10
-
-    msg "Discovering VM IP address..."
-    local attempts=0
-    while (( attempts < 12 )); do
-        VM_IP=$(get_vm_ip "$TEMP_VMID") && [[ -n "$VM_IP" ]] && break
-        sleep 5
-        (( attempts++ )) || true
-    done
-    [[ -n "$VM_IP" ]] || die "Could not determine VM IP address"
-    ok "VM IP: $VM_IP"
-
-    msg "Waiting for SSH (timeout: ${SSH_TIMEOUT}s)..."
-    if ! wait_for_ssh "$VM_IP" "$SSH_KEY_FILE" "$SSH_TIMEOUT"; then
-        die "SSH not available at root@${VM_IP} within ${SSH_TIMEOUT}s"
-    fi
-    ok "SSH connection established"
-
-    # ==== STEP 8: install packages via SSH ====================================
+    # ==== STEP 8: install packages via guest agent ============================
     install_packages
 
     # ==== STEP 9: run ReaR ====================================================
@@ -1068,41 +1131,52 @@ main() {
     msg "Running rear ${rear_cmd} inside VM (timeout: ${REAR_TIMEOUT}s)..."
     msg "This may take several minutes..."
 
-    # Locate rear binary — /usr/sbin may not be in the non-login SSH PATH
+    # Locate rear binary (may be at /usr/sbin or /sbin depending on distro)
     local rear_bin
-    rear_bin=$(vm_ssh "command -v rear 2>/dev/null || find /usr/sbin /usr/bin /sbin /bin -name rear -type f 2>/dev/null | head -1") || true
+    rear_bin=$(vm_exec 10 "command -v rear 2>/dev/null || find /usr/sbin /usr/bin /sbin /bin -name rear -type f 2>/dev/null | head -1" 2>/dev/null) || true
+    rear_bin=$(echo "$rear_bin" | tr -d '[:space:]')
     [[ -z "$rear_bin" ]] && die "rear binary not found in VM — package installation may have failed"
     ok "rear found at: $rear_bin"
-    if ! vm_ssh "${rear_bin} -v ${rear_cmd}" < /dev/null; then
-        die "rear ${rear_cmd} failed — check VM ${TEMP_VMID} for details"
+    if ! vm_exec "$REAR_TIMEOUT" "${rear_bin} -v ${rear_cmd}" > /dev/null 2>&1; then
+        die "rear ${rear_cmd} failed — check VM ${TEMP_VMID} logs"
     fi
     ok "ReaR build complete"
 
-    # ==== STEP 10: extract ISO ================================================
-    msg "Copying ISO from VM..."
-    local remote_iso
-    remote_iso=$(vm_ssh "ls -1t /var/lib/rear/output/*.iso 2>/dev/null | head -1") || true
+    # ==== STEP 10: extract ISO via virt-copy-out ==============================
+    # Stop the VM so we can access the disk, then extract the ISO directly
+    # from the filesystem.  No network/SSH needed.
+    msg "Stopping VM to extract ISO..."
+    qm stop "$TEMP_VMID" --timeout 60 2>/dev/null || true
+    local waited=0
+    while (( waited < 60 )); do
+        local st
+        st=$(qm status "$TEMP_VMID" 2>/dev/null | awk '{print $2}') || break
+        [[ "$st" == "stopped" ]] && break
+        sleep 2
+        (( waited += 2 ))
+    done
 
-    [[ -n "$remote_iso" ]] || die "No ISO found in /var/lib/rear/output/ on VM"
+    DISK_PATH=$(get_disk_path "$TEMP_VMID")
+    msg "Extracting ISO from disk image..."
+    local iso_tmp="${TEMP_DIR}/iso-extract"
+    mkdir -p "$iso_tmp"
+    virt-copy-out -a "$DISK_PATH" /var/lib/rear/output/ "$iso_tmp/" 2>/dev/null || \
+        die "Failed to extract ISO from VM disk"
 
-    scp -i "$SSH_KEY_FILE" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        "root@${VM_IP}:${remote_iso}" "$OUTPUT_DIR/"
+    local source_iso
+    source_iso=$(find "$iso_tmp" -name '*.iso' -type f | head -1)
+    [[ -n "$source_iso" ]] || die "No ISO found in /var/lib/rear/output/ on VM disk"
 
     # Rename to a descriptive filename
-    local base_iso timestamp final_iso
-    base_iso=$(basename "$remote_iso")
+    local timestamp final_iso
     timestamp=$(date +%Y%m%d%H%M)
     final_iso="tshoot-${DISTRO_FAMILY}-${DISTRO_VERSION}-${timestamp}.iso"
-    mv "$OUTPUT_DIR/$base_iso" "$OUTPUT_DIR/$final_iso"
+    mv "$source_iso" "$OUTPUT_DIR/$final_iso"
 
     ok "ISO saved: ${OUTPUT_DIR}/${final_iso}"
 
     # ==== STEP 11: destroy temp VM (cleanup trap is the safety net) ===========
     msg "Destroying temporary VM ${TEMP_VMID}..."
-    qm stop "$TEMP_VMID" --timeout 30 2>/dev/null || true
-    sleep 3
     qm destroy "$TEMP_VMID" --purge 2>/dev/null || \
         warn "Could not destroy VM ${TEMP_VMID} — clean up manually"
     TEMP_VMID=""  # cleared so the EXIT trap skips destroy
