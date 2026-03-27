@@ -188,7 +188,7 @@ The ISO boots into a rescue environment pre-loaded with network diagnostic tools
 
 | Mode | Where to run | ISO destination | Requirements |
 |---|---|---|---|
-| **Local** | Directly on a PVE node (as root) | PVE node filesystem | PVE tools + libguestfs |
+| **Local** | Directly on a PVE node (as root) | PVE node filesystem | PVE tools + libguestfs + python3 |
 | **Remote** | From a jump host (`-S user@host`) | Jump host filesystem | `ssh` + `scp` only |
 
 In remote mode the script copies itself and the CSV to the PVE node, builds the ISO there, then downloads it back to the jump host.
@@ -227,6 +227,10 @@ pve-create-tshoot-image -t 9000 -c hosts.csv -S root@pve1.example.com
 pve-create-tshoot-image -t 9000 -c hosts.csv \
     --vlan-id 100 --netmask /24 --gateway 10.0.0.1 --dns 8.8.8.8
 
+# Build VM on a different VLAN with HTTP proxy
+pve-create-tshoot-image -t 9000 -c hosts.csv \
+    --vm-vlan 302 --vm-proxy http://proxy:3128
+
 # Rescue-only (smaller ISO, no backup)
 pve-create-tshoot-image -t 9000 -c hosts.csv --rescue-only
 ```
@@ -251,7 +255,7 @@ Bond members use `:` as separator to allow for different hardware across servers
 | `--netmask` | Network mask (e.g. `/24`) | *(required with --gateway/--dns)* |
 | `--gateway` | Default gateway | *(required with --netmask/--dns)* |
 | `--dns` | Comma-separated DNS servers | *(required with --netmask/--gateway)* |
-| `--proxy` | HTTP/HTTPS proxy URL | *(optional)* |
+| `--proxy` | HTTP/HTTPS proxy for restored hosts | *(optional)* |
 
 Per-host IP and bond members come from the CSV (allowing different hardware per server). The shared parameters above define how the management interface is constructed (bond → VLAN → IP assignment).
 
@@ -264,17 +268,20 @@ Per-host IP and bond members come from the CSV (allowing different hardware per 
 | `--vm-ip` | Build VM IP (`dhcp` or `IP/MASK`) | `dhcp` |
 | `--vm-gateway` | Gateway (required if static) | |
 | `--vm-dns` | DNS (optional for static) | |
+| `--vm-proxy` | HTTP/HTTPS proxy for build VM | *(optional)* |
+
+All VM interaction uses the QEMU guest agent (virtio serial channel) — no network connectivity is required between the PVE host and the build VM.  This allows building on any VLAN regardless of L3 routing.
 
 **Workflow:**
 
 1. Clone the specified PVE template to a temporary VM (full clone)
 2. Detect the distribution from the disk image (`/etc/os-release`)
-3. Resize disk (+10G), inject config files via `virt-customize`, wipe host identity
-4. Boot the VM (cloud-init grows the filesystem), install packages via SSH
-5. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`)
-6. Copy the ISO to the output directory, destroy the temporary VM
+3. Resize disk (+10G), inject config files via `virt-customize`, wipe host identity, enable guest-exec
+4. Boot the VM (cloud-init grows the filesystem), install packages via QEMU guest agent
+5. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`) via guest agent
+6. Stop the VM, extract the ISO via `virt-copy-out`, destroy the temporary VM
 
-**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `ssh-keygen`, `ssh`, `scp`.
+**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `virt-copy-out`, `python3`.
 
 **Dependencies (remote mode):** `ssh` and `scp` only (PVE tools are used on the remote node).
 
