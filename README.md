@@ -309,6 +309,12 @@ Man pages are provided in `man/man8/`. To install them:
 cp man/man8/*.8 /usr/local/share/man/man8/
 ```
 
+Bash completions are provided in `completions/`. To install them:
+
+```bash
+cp completions/pve-tools.bash /etc/bash_completion.d/pve-tools
+```
+
 ## License
 
 MIT
