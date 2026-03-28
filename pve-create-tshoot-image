@@ -31,7 +31,8 @@
 # The build VM is an intermediate state — host identity files (machine-id,
 # SSH host keys, etc.) are wiped so each restored system is unique.
 #
-# Supported base distributions: Rocky Linux, Ubuntu LTS, openSUSE Leap.
+# Supported base distributions: Rocky Linux 9, Ubuntu LTS (22.04, 24.04),
+# openSUSE Leap 15.x.  openSUSE Leap 16.x builds but ReaR rescue fails.
 #
 # All VM interaction uses the QEMU guest agent (virtio serial channel) —
 # no SSH or network connectivity required between PVE host and build VM.
@@ -45,7 +46,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 set -euo pipefail
 
@@ -360,6 +361,12 @@ MODULES_LOAD+=( bonding 8021q )
 
 # Include all firmware for broad hardware compatibility.
 FIRMWARE_FILES=( 'yes' )
+
+# Override the build VM's console settings so the rescue ISO works on both
+# VGA (IPMI/KVM) and serial (BMC/headless) consoles.  Linux outputs to all
+# listed consoles; the last one gets interactive input (tty0 = VGA).
+USE_SERIAL_CONSOLE=no
+KERNEL_CMDLINE="console=ttyS0,115200 console=tty0"
 EOF
 }
 
@@ -1698,7 +1705,9 @@ ${C_BOLD}CSV format${C_RESET} (one host per line, # for comments):
   SVR002,db-server-01,eno1:eno2,10.0.0.12
 
 ${C_BOLD}Supported distributions:${C_RESET}
-  Rocky Linux (8, 9)    Ubuntu LTS (22.04, 24.04)    openSUSE Leap (15.x, 16.x)
+  Rocky Linux (9)    Ubuntu LTS (22.04, 24.04)    openSUSE Leap (15.x)
+  Note: openSUSE Leap 16.x builds succeed but ReaR rescue boot fails
+  due to udev incompatibility — not yet supported for restore.
 
 ${C_BOLD}Examples:${C_RESET}
   # Local mode — run on a PVE node, ISO stays in current directory

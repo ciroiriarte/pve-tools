@@ -1,7 +1,7 @@
 .\" pve-create-tshoot-image - Build a ReaR troubleshooting ISO from a PVE template
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-CREATE\-TSHOOT\-IMAGE 8 "2026-03-28" "1.2.0" "Proxmox VE Tools"
+.TH PVE\-CREATE\-TSHOOT\-IMAGE 8 "2026-03-28" "1.3.0" "Proxmox VE Tools"
 .SH NAME
 pve\-create\-tshoot\-image \- build a ReaR troubleshooting / restore ISO from a
 Proxmox VE cloud\-init template
@@ -61,14 +61,20 @@ are needed locally.
 .SS Supported distributions
 .TS
 tab(|);
-lb lb lb
-l l l.
-Family|Package manager|Extras
+lb lb lb lb
+l l l l.
+Family|Package manager|Network manager|Extras
 _
-Rocky Linux (8, 9)|dnf + EPEL|nic-xray from OBS
-Ubuntu LTS (22.04, 24.04)|apt|nic-xray from OBS
-openSUSE Leap (15.x, 16.x)|zypper|nic-xray from OBS
+Rocky Linux 9|dnf + EPEL|NetworkManager|nic-xray from OBS
+Ubuntu LTS 22.04|apt|netplan/networkd|nic-xray from OBS
+Ubuntu LTS 24.04|apt|netplan/networkd|nic-xray from OBS
+openSUSE Leap 15.x|zypper|wicked|nic-xray from OBS
 .TE
+.PP
+.B Note:
+openSUSE Leap 16.x builds successfully but the ReaR rescue system
+fails to boot due to udev incompatibility with the 6.12 kernel.
+It is not supported for restore until ReaR ships a compatible version.
 .SS Build workflow
 .IP 1. 4
 Clone the specified template to a temporary VM (full clone).
