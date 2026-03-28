@@ -1,7 +1,7 @@
 .\" pve-create-tshoot-image - Build a ReaR troubleshooting ISO from a PVE template
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-CREATE\-TSHOOT\-IMAGE 8 "2026-03-27" "1.0.0" "Proxmox VE Tools"
+.TH PVE\-CREATE\-TSHOOT\-IMAGE 8 "2026-03-27" "1.1.0" "Proxmox VE Tools"
 .SH NAME
 pve\-create\-tshoot\-image \- build a ReaR troubleshooting / restore ISO from a
 Proxmox VE cloud\-init template
@@ -153,6 +153,23 @@ is specified.
 .TP
 .BI \-\-proxy " URL"
 HTTP/HTTPS proxy for restored hosts.
+.SS Target\-host identity
+These parameters configure user credentials on the restored system.
+A systemd oneshot service applies them on first boot using the DMI serial
+and CSV inventory.
+.TP
+.BI \-\-target\-user " USER"
+User account to create (or configure if it already exists).
+The user is given passwordless sudo access.
+.TP
+.BI \-\-target\-password " PW"
+Password for the target user.
+Hashed (SHA\-512) before embedding in the ISO.
+.TP
+.BI \-\-target\-ssh\-key " KEY"
+Path to an SSH public key file, or the literal key string.
+Installed into
+.IR ~USER/.ssh/authorized_keys .
 .SS Build\-VM network
 These parameters control networking for the temporary build VM only.
 .TP
