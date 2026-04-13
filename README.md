@@ -5,6 +5,7 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
 ## Contents
 
 - [pve-import-cloud-images](#pve-import-cloud-images) - Import upstream cloud images as PVE templates
+  - [Cloud-init usage](cloud-init-usage.md) - Provisioning examples and sample snippets
 - [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
 - [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
 - [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
@@ -78,29 +79,18 @@ sysrc qemu_guest_agent_enable=YES
 service qemu-guest-agent start
 ```
 
-To automate this via cloud-init, create a user-data snippet on a snippets-enabled storage (e.g. `local:snippets/freebsd-agent.yml`):
-
-```yaml
-#cloud-config
-hostname: my-freebsd-vm
-ssh_authorized_keys:
-  - ssh-rsa AAAA... user@host
-users:
-  - default
-packages:
-  - qemu-guest-agent
-runcmd:
-  - sysrc qemu_guest_agent_enable=YES
-  - service qemu-guest-agent start
-```
-
-Then apply it to the VM:
+To automate this via cloud-init, copy [`samples/ci-user-freebsd.yaml`](samples/ci-user-freebsd.yaml) to a snippets-enabled storage and apply it to the VM:
 
 ```bash
-qm set <vmid> --cicustom "user=local:snippets/freebsd-agent.yml"
+cp samples/ci-user-freebsd.yaml /var/lib/vz/snippets/
+qm set <vmid> --cicustom "user=local:snippets/ci-user-freebsd.yaml"
+qm cloudinit update <vmid>
+qm start <vmid>
 ```
 
-> **Note:** FreeBSD uses `nuageinit` instead of Python cloud-init. It does not read `vendor-data`, so `cicustom user=` is required — which replaces PVE's auto-generated user-data. The snippet must include all cloud-init settings (hostname, SSH keys, users, etc.).
+> **Note:** FreeBSD uses `nuageinit` instead of Python cloud-init. It does not read `vendor-data`, so `cicustom user=` is required — which replaces PVE's auto-generated user-data. The snippet must include all settings (SSH keys, users, etc.); hostname is set by PVE via the VM name and does not need to be in the snippet.
+
+See [cloud-init-usage.md](cloud-init-usage.md) for full provisioning documentation.
 
 **API mode:**
 

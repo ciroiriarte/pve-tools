@@ -1,0 +1,38 @@
+#cloud-config
+# User-data for a FreeBSD VM cloned from a PVE cloud-init template.
+#
+# Hostname is NOT set here — it comes from PVE via meta-data (the VM name).
+#
+# FreeBSD uses nuageinit instead of Python cloud-init.  Key differences:
+#   - nuageinit does NOT read vendor-data; cicustom user= is required.
+#   - Setting cicustom user= replaces PVE's generated user-data entirely.
+#   - All settings (users, SSH keys) must be included in this file.
+#   - qemu-guest-agent cannot be pre-installed offline (Linux cannot write
+#     to UFS2), so it is installed via runcmd on first boot.
+#
+# Apply to a VM:
+#   qm set <vmid> --cicustom "user=local:snippets/ci-user-freebsd.yaml"
+#   qm cloudinit update <vmid>
+#   qm start <vmid>
+
+# Timezone — PVE has no native cloud-init timezone option; set it here.
+# See: tzsetup -l  (FreeBSD) or timedatectl list-timezones (Linux)
+timezone: UTC
+
+users:
+  - default
+  - name: admin
+    gecos: Admin User
+    groups: wheel
+    shell: /bin/sh
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... user@workstation
+
+ssh_pwauth: false
+
+packages:
+  - qemu-guest-agent
+
+runcmd:
+  - sysrc qemu_guest_agent_enable=YES
+  - service qemu-guest-agent start

@@ -1,0 +1,54 @@
+#cloud-config
+# User-data example: install packages and run commands on first boot.
+#
+# Hostname is NOT set here — it comes from PVE via meta-data (the VM name).
+#
+# Demonstrates: users with SSH key, package installation, write_files, runcmd.
+# Replaces PVE's auto-generated user-data — include all user/key settings.
+#
+# Apply to a VM:
+#   qm set <vmid> --cicustom "user=local:snippets/ci-user-packages.yaml"
+#   qm cloudinit update <vmid>
+#   qm start <vmid>
+
+# Timezone — PVE has no native cloud-init timezone option; set it here.
+# See: timedatectl list-timezones
+timezone: UTC
+
+users:
+  - default
+  - name: deploy
+    gecos: Deploy User
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... deploy@ci
+
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true
+packages:
+  - qemu-guest-agent
+  - curl
+  - git
+  - htop
+  - vim
+
+write_files:
+  - path: /etc/motd
+    content: |
+      Provisioned by cloud-init via PVE template
+    owner: root:root
+    permissions: "0644"
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  # Example: pull application config from an internal endpoint
+  # - curl -fsSL http://config.example.com/app.conf -o /etc/app/app.conf
+
+final_message: |
+  Cloud-init provisioning complete.
+  Version: $version
+  Uptime: $uptime seconds

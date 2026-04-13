@@ -1,0 +1,22 @@
+#cloud-config
+# Vendor-data snippet: install qemu-guest-agent on Linux templates.
+#
+# Place this file on a snippets-enabled PVE storage, then apply it to a VM:
+#
+#   qm set <vmid> --cicustom "vendor=local:snippets/ci-vendor-qemu-guest-agent.yaml"
+#
+# vendor-data runs after user-data and does NOT replace PVE's auto-generated
+# user-data (hostname, SSH keys, IP config).  This is the recommended way to
+# add packages without losing PVE's native cloud-init integration.
+#
+# Required by pve-import-cloud-images API mode — see README.md.
+#
+# PVE has no native cloud-init timezone setting.  Set it here so it applies
+# to all VMs using this vendor snippet.  See: timedatectl list-timezones
+timezone: UTC
+
+package_update: true
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable --now qemu-guest-agent

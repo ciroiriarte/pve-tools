@@ -1,0 +1,36 @@
+#cloud-config
+# Basic user-data for a Linux VM cloned from a PVE cloud-init template.
+# Authentication: SSH public key only (password login disabled).
+#
+# Hostname is NOT set here — it comes from PVE via meta-data (the VM name
+# configured in the PVE web UI or with `qm set <vmid> --name <hostname>`).
+#
+# IMPORTANT: using cicustom user= REPLACES PVE's auto-generated user-data
+# entirely.  PVE's Cloud-Init UI fields for Hostname, User, and Password
+# are ignored — configure users and keys in this file instead.
+#
+# Apply to a VM:
+#   qm set <vmid> --cicustom "user=local:snippets/ci-user-basic.yaml"
+#   qm cloudinit update <vmid>
+#   qm start <vmid>
+
+# Timezone — PVE has no native cloud-init timezone option; set it here.
+# See: timedatectl list-timezones
+timezone: UTC
+
+# Create a non-root admin user with sudo access and SSH key authentication
+users:
+  - default
+  - name: admin
+    gecos: Admin User
+    groups: [sudo, adm]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... user@workstation
+
+# Disable password authentication over SSH (key-only)
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true

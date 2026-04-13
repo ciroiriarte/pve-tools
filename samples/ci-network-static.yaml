@@ -1,0 +1,35 @@
+# Network configuration v2 (cloud-init network-data).
+#
+# Configures a static IP on the first ethernet interface.
+# This replaces PVE's auto-generated network-data when applied via cicustom.
+#
+# Apply to a VM:
+#   qm set <vmid> --cicustom "network=local:snippets/ci-network-static.yaml"
+#   qm cloudinit update <vmid>
+#   qm start <vmid>
+#
+# For simple static IP assignment, PVE's native ipconfig is sufficient and
+# requires no snippet:
+#   qm set <vmid> --ipconfig0 ip=192.168.1.50/24,gw=192.168.1.1 \
+#       --nameserver "192.168.1.1 8.8.8.8" --searchdomain example.com
+#
+# Use a network snippet when you need settings PVE's ipconfig does not expose:
+# multiple search domains, custom routes, bonding, VLANs, etc.
+
+version: 2
+ethernets:
+  eth0:
+    match:
+      name: "en*"
+    set-name: eth0
+    addresses:
+      - 192.168.1.50/24
+    nameservers:
+      addresses:
+        - 192.168.1.1
+        - 8.8.8.8
+      search:
+        - example.com
+    routes:
+      - to: default
+        via: 192.168.1.1
