@@ -113,3 +113,44 @@ _pve_create_tshoot_image() {
 }
 
 complete -F _pve_create_tshoot_image pve-create-tshoot-image
+
+# --- pve-sdn-healthcheck ------------------------------------------------------
+
+# Canonical check names (keep in sync with `pve-sdn-healthcheck --list-checks`).
+_PVE_SDN_CHECKS="ip_forward frr_daemon iface_link iface_errors iface_flap \
+optics_dom bond_lacp mtu_local bgp_evpn bgp_external vtep_reach ceph_net \
+evpn_vnis evpn_routes irb_gw l3vni_fdb rib_fib vrf_reach vmnic_plumbing"
+
+_pve_sdn_healthcheck() {
+    local cur prev opts
+    _init_completion || return
+
+    opts="--node --only --check --explain -a --all --json --no-color
+          --list-checks --fix --apply -y --yes -h --help -v --version"
+
+    case "$prev" in
+        --only)
+            COMPREPLY=( $(compgen -W "underlay overlay" -- "$cur") )
+            return
+            ;;
+        --check|--explain)
+            COMPREPLY=( $(compgen -W "$_PVE_SDN_CHECKS" -- "$cur") )
+            return
+            ;;
+        --fix)
+            # --fix takes an optional check name (auto-fixable subset)
+            COMPREPLY=( $(compgen -W "ip_forward vmnic_plumbing frr_daemon" -- "$cur") )
+            return
+            ;;
+        --node)
+            # Host/IP list; no useful default completions
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+
+complete -F _pve_sdn_healthcheck pve-sdn-healthcheck

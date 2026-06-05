@@ -1,0 +1,282 @@
+.\" pve-sdn-healthcheck - Validate the SDN network layer of a Proxmox VE cluster
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-SDN\-HEALTHCHECK 8 "2026-06-04" "1.0.0" "Proxmox VE Tools"
+.SH NAME
+pve\-sdn\-healthcheck \- validate the underlay and overlay network of a Proxmox VE SDN cluster
+.SH SYNOPSIS
+.B pve\-sdn\-healthcheck
+.RI [ options ]
+.br
+.B pve\-sdn\-healthcheck
+.RB [ \-\-node
+.IR a , b , c ]
+.RB [ \-\-only
+.IR underlay | overlay ]
+.RB [ \-\-all ]
+.RB [ \-\-json ]
+.br
+.B pve\-sdn\-healthcheck
+.RB [ \-\-fix
+.RI [ CHECKS ]]
+.RB [ \-\-apply ]
+.RB [ \-\-yes ]
+.br
+.B pve\-sdn\-healthcheck
+.B \-\-explain
+.I CHECK
+.SH DESCRIPTION
+.B pve\-sdn\-healthcheck
+is a strictly read\-only validator for the network layer of a hyper\-converged
+Proxmox VE cluster running FRR with BGP\-EVPN/VXLAN (the Proxmox SDN stack).
+It connects to every cluster node over SSH, runs a battery of underlay and
+overlay checks on each, and aggregates the results into an operator\-friendly,
+fail\-first report with a single cluster\-wide verdict.
+.PP
+The tool is portable: every site\-specific entity (node list, VTEP peers, L3
+VNIs/VRFs, external BGP peers) is
+.B auto\-discovered
+from the live system, so it runs unmodified on any PVE + FRR/EVPN cluster.
+Nodes without an SDN overlay are detected and their overlay/forwarding checks
+are skipped rather than failed.
+.PP
+Each check is classified by severity \(em
+.BR OK ", " WARN ", or " FAIL
+\(em and the process exits with the highest severity seen, using the Nagios
+convention so the tool can drive monitoring (LibreNMS, Zabbix, Icinga) and CI.
+.SS Checks performed
+.B Underlay:
+IPv4 forwarding (runtime + persistence), FRR daemon health, physical link
+state, NIC errors/drops, link flapping, SFP/QSFP optic DOM (temperature and
+optical power, on lit ports only), bond/LACP state, MTU headroom (VXLAN
+transport must exceed the overlay MTU by at least 50 bytes), internal
+BGP\-EVPN fabric sessions, per\-VRF external BGP peering (IPv4 and IPv6), VTEP
+reachability, and Ceph network health.
+.PP
+.B Overlay:
+presence of expected L2/L3 VNIs (control plane vs. kernel), EVPN route
+population, anycast\-gateway/IRB state, L3\-VNI FDB completeness (distinguishing
+a real symmetric\-IRB black\-hole from benign on\-demand absence), and RIB/FIB
+consistency (catching a stuck/phantom zebra route).
+.PP
+.B Plumbing:
+each running guest's NIC chain
+.RB ( tap / veth " \(-> " fwbr / fwpr / fwln " \(-> " vnet / vmbr )
+is verified intact, mirroring the detection logic of
+.BR pve\-vmnic\-fix (8).
+.SH OPTIONS
+.TP
+.BR \-\-node " " \fIa\fR,\fIb\fR,\fIc\fR
+Check only the listed nodes (host names or IPs, optionally
+.IR user @ host ).
+Default: auto\-discover all cluster members.
+.TP
+.BR \-\-only " " \fIunderlay\fR|\fIoverlay\fR
+Run only one layer of checks.
+.TP
+.BR \-\-check " " \fINAME\fR[,\fINAME\fR...]
+Run only the named checks (see
+.BR \-\-list\-checks ).
+.TP
+.BR \-\-explain " " \fICHECK\fR
+Print what a check validates, why it matters, and how WARN/FAIL are decided,
+then exit.
+.TP
+.BR \-a ", " \-\-all
+Also show
+.B OK
+lines (by default only WARN and FAIL are shown, plus a hidden\-count note).
+.TP
+.B \-\-json
+Emit a machine\-readable JSON document (schema_version 1.0) for monitoring
+ingestion instead of the human report.
+.TP
+.B \-\-no\-color
+Disable ANSI colour (also auto\-disabled when stdout is not a terminal).
+.TP
+.B \-\-list\-checks
+Print the check catalogue and exit.
+.TP
+.BR \-\-fix " [" \fICHECKS\fR ]
+Preview safe, allow\-listed auto\-remediations for any detected, fixable issues.
+With no argument, all allow\-listed checks are considered. This only
+.B previews
+\(em nothing is changed.
+.TP
+.B \-\-apply
+Execute the previewed fixes. Implies
+.BR \-\-fix ,
+requires root, and appends an audit record to
+.IR /var/log/pve\-sdn\-healthcheck\-fix.log .
+.TP
+.BR \-y ", " \-\-yes
+Skip the interactive confirmation for
+.BR \-\-apply
+(required when running non\-interactively).
+.TP
+.BR \-h ", " \-\-help
+Show the built\-in help message and exit.
+.TP
+.BR \-v ", " \-\-version
+Show the version number and exit.
+.SH AUTO-REMEDIATION
+.B pve\-sdn\-healthcheck
+is read\-only by default. The optional
+.B \-\-fix
+facility is strictly opt\-in and limited to a small allow\-list of safe,
+idempotent, locally\-scoped repairs:
+.IP \(bu 3
+.B ip_forward
+\(em set and persist
+.B net.ipv4.ip_forward=1
+(and the matching forwarding sysctls) in
+.IR /etc/sysctl.d/ .
+.IP \(bu 3
+.B vmnic_plumbing
+\(em repair a broken guest NIC chain by delegating to
+.BR pve\-vmnic\-fix (8).
+.IP \(bu 3
+.B frr_daemon
+\(em enable FRR at boot
+.RB ( "systemctl enable frr" ;
+no restart).
+.PP
+Everything else \(em BGP/EVPN sessions, zebra/FRR restarts, MTU, optics,
+bonding \(em is reported with guidance but
+.B never
+changed automatically, because such actions require human judgement and can
+widen an outage. Fixes preview by default;
+.B \-\-apply
+is required to execute and is logged.
+.SH EXAMPLES
+Check the whole cluster (auto\-discovered nodes):
+.PP
+.RS
+.nf
+pve\-sdn\-healthcheck
+.fi
+.RE
+.PP
+Only the overlay, on two named nodes, showing every check:
+.PP
+.RS
+.nf
+pve\-sdn\-healthcheck \-\-node pve01,pve02 \-\-only overlay \-\-all
+.fi
+.RE
+.PP
+Explain a specific check:
+.PP
+.RS
+.nf
+pve\-sdn\-healthcheck \-\-explain l3vni_fdb
+.fi
+.RE
+.PP
+Preview, then apply, safe auto\-fixes:
+.PP
+.RS
+.nf
+pve\-sdn\-healthcheck \-\-fix
+pve\-sdn\-healthcheck \-\-fix ip_forward \-\-apply \-\-yes
+.fi
+.RE
+.PP
+Feed a monitoring system:
+.PP
+.RS
+.nf
+pve\-sdn\-healthcheck \-\-json | jq .counts
+.fi
+.RE
+.PP
+Run from a management host that is not a cluster member, via a jump host:
+.PP
+.RS
+.nf
+SDN_NODES='root@10.0.0.4 root@10.0.0.10' \\
+  SDN_SSH_OPTS='\-J admin@jump.example' pve\-sdn\-healthcheck
+.fi
+.RE
+.SH CONFIGURATION
+All entities auto\-discover; the following are
+.B optional
+overrides, settable in the environment or in
+.IR /etc/pve\-sdn\-healthcheck.conf
+(a sourced shell fragment):
+.TP
+.B SDN_NODES
+Space\-separated node host/IPs to iterate (optionally
+.IR user @ host ).
+.TP
+.B SDN_SSH_OPTS
+Extra options passed to
+.BR ssh (1),
+e.g.
+.B \-J
+for a jump host or
+.B \-i
+for an identity file.
+.TP
+.B SDN_VTEPS
+Remote VTEP underlay IPs to probe (default: discovered from the EVPN peers).
+.TP
+.BR SDN_FW_MASTER ", " SDN_FW_BACKUP
+Pin the master/backup external BGP peer; a down master is escalated to FAIL,
+a down backup to WARN.
+.TP
+.B SDN_L3VNIS
+List of
+.IR vxlan_if : vrf : vni
+tuples (default: discovered from
+.BR "vtysh -c 'show evpn vni'" ).
+.TP
+.B SDN_MTU_DELTA
+Required underlay\-over\-overlay MTU headroom in bytes (default 50; use 70 for
+an IPv6 underlay).
+.TP
+.B SDN_VRF_PROBES
+Optional
+.IR vrf : probe_ip
+targets enabling a strict data\-plane probe for the L3\-VNI black\-hole check.
+.SH EXIT STATUS
+.TP
+.B 0
+OK \(em all checks passed.
+.TP
+.B 1
+WARN \(em at least one warning, no failures.
+.TP
+.B 2
+CRIT \(em at least one failure.
+.TP
+.B 3
+UNKNOWN \(em usage/dependency error, or a node was unreachable.
+.SH DEPENDENCIES
+Controller:
+.BR bash (1),
+.BR ssh (1).
+Each node:
+.BR vtysh (8)
+(FRR),
+.BR ip (8),
+.BR bridge (8),
+.BR sysctl (8).
+Optional, used when present:
+.BR ethtool (8),
+.BR jq (1),
+.BR journalctl (1),
+.BR pve\-vmnic\-fix (8).
+.SH SEE ALSO
+.BR pve\-vmnic\-fix (8),
+.BR pve\-import\-cloud\-images (8),
+.BR pve\-create\-tshoot\-image (8),
+.BR vtysh (8),
+.BR ip (8),
+.BR bridge (8),
+.BR ethtool (8)
+.SH AUTHORS
+Ciro Iriarte
+.RI < ciro.iriarte+software@gmail.com >
+.SH LICENSE
+MIT

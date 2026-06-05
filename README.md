@@ -7,6 +7,7 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
 - [pve-import-cloud-images](#pve-import-cloud-images) - Import upstream cloud images as PVE templates
 - [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
 - [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
+- [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
 - [Installation](#installation)
 - [License](#license)
 
@@ -295,12 +296,82 @@ All VM interaction uses the QEMU guest agent (virtio serial channel) — no netw
 
 ---
 
+## pve-sdn-healthcheck
+
+Validate the entire network layer of a Proxmox VE + FRR/BGP-EVPN/VXLAN cluster
+— underlay **and** overlay — in one read-only command.
+
+Connects to every node over SSH, runs underlay and overlay checks on each, and
+aggregates them into a fail-first report with a single cluster-wide verdict and
+Nagios exit codes (for LibreNMS / Zabbix / Icinga / CI).
+
+**Portable by design** — every site-specific entity (node list, VTEP peers, L3
+VNIs/VRFs, external BGP peers) is auto-discovered from the live system, so it
+runs unmodified on any cluster. Non-SDN nodes are detected and their
+overlay/forwarding checks are skipped rather than failed.
+
+**Checks**
+
+| Layer | Checks |
+|---|---|
+| Underlay | ip_forward (runtime + persistence), FRR daemon, link state, NIC errors/drops, link flapping, SFP/QSFP optic DOM, bond/LACP, MTU headroom, BGP-EVPN fabric, per-VRF external peering (v4+v6), VTEP reachability, Ceph net |
+| Overlay | L2/L3 VNIs (control vs kernel), EVPN routes, anycast-gateway/IRB, L3-VNI FDB (black-hole vs benign on-demand), RIB/FIB consistency |
+| Plumbing | Guest NIC chain `tap/veth → fwbr/fwpr/fwln → vnet` intact (mirrors `pve-vmnic-fix`) |
+
+**Usage:**
+
+```bash
+# Check the whole cluster (auto-discovered nodes)
+pve-sdn-healthcheck
+
+# Two nodes, overlay only, show every check (not just WARN/FAIL)
+pve-sdn-healthcheck --node pve01,pve02 --only overlay --all
+
+# Explain a check (what it validates / why / how WARN vs FAIL)
+pve-sdn-healthcheck --explain l3vni_fdb
+
+# Feed monitoring
+pve-sdn-healthcheck --json | jq .counts
+
+# From a non-member management host, via a jump host
+SDN_NODES='root@10.0.0.4 root@10.0.0.10' \
+  SDN_SSH_OPTS='-J admin@jump.example' pve-sdn-healthcheck
+```
+
+**Safe auto-remediation (opt-in):** `--fix` previews, `--apply` executes
+(root, logged to `/var/log/pve-sdn-healthcheck-fix.log`). The allow-list is
+limited to safe, idempotent repairs — `ip_forward` (set + persist),
+`vmnic_plumbing` (delegates to `pve-vmnic-fix`), and `frr_daemon` (enable at
+boot). BGP/EVPN, zebra/FRR restarts, MTU, optics and bonding are **never**
+auto-fixed.
+
+```bash
+pve-sdn-healthcheck --fix                       # preview
+pve-sdn-healthcheck --fix ip_forward --apply    # apply (asks to confirm)
+```
+
+**Configuration:** everything auto-discovers; optional overrides
+(`SDN_NODES`, `SDN_SSH_OPTS`, `SDN_FW_MASTER`/`SDN_FW_BACKUP`, `SDN_L3VNIS`,
+`SDN_VTEPS`, `SDN_MTU_DELTA`, `SDN_VRF_PROBES`) may be set in the environment or
+in `/etc/pve-sdn-healthcheck.conf`. Setting `SDN_VRF_PROBES="<vrf>:<ip>"`
+upgrades the L3-VNI check from a cautious WARN to a definitive PASS/FAIL via a
+data-plane probe.
+
+**Exit codes:** `0` OK · `1` WARN · `2` CRIT (FAIL) · `3` UNKNOWN (usage error
+or unreachable node).
+
+**Dependencies:** controller needs `bash` and `ssh`; each node needs `vtysh`
+(FRR), `ip`/`bridge`, `sysctl`. Optional and used when present: `ethtool`,
+`jq`, `journalctl`, `pve-vmnic-fix`.
+
+---
+
 ## Installation
 
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck /usr/local/sbin/
 ```
 
 Man pages are provided in `man/man8/`. To install them:

@@ -1,0 +1,897 @@
+#!/bin/bash
+# pve-sdn-healthcheck - Copyright (c) 2024-2026 Ciro Iriarte
+# SPDX-License-Identifier: MIT
+# =============================================================================
+#  pve-sdn-healthcheck  --  network validator for a Proxmox VE + Ceph
+#                          + FRR/BGP-EVPN/VXLAN cluster (underlay + overlay)
+# -----------------------------------------------------------------------------
+#  PURPOSE
+#    One read-only command that SSHes to every cluster node and validates the
+#    entire network layer: physical NICs/optics, bonds, MTU, BGP-EVPN control
+#    plane, VXLAN/IRB data plane, IP forwarding, RIB/FIB consistency, and the
+#    firewall EVPN-to-external adjacency.  Designed to catch the exact failure
+#    modes seen in production (see "KNOWN FAILURE MODES" below) and to be read
+#    by an on-call operator at 3 a.m. without prior context.
+#
+#  SAFETY
+#    *** STRICTLY READ-ONLY ***  This script only ever runs "show"/"get"/read
+#    commands (vtysh -c 'show ...', ip/bridge show, ethtool, sysctl -n, ping).
+#    It never mutates configuration, restarts services, or writes files.
+#
+#  KNOWN FAILURE MODES THIS SCRIPT DETECTS (from real incidents)
+#    1. net.ipv4.ip_forward=0 (or conf.all/default.forwarding) -> overlay<->
+#       external transit black-holed.  Checks runtime AND persistence.
+#    2. L3-VNI VXLAN FDB missing a remote VTEP router-MAC -> symmetric-IRB
+#       black-hole.  Distinguishes a REAL black-hole from BENIGN on-demand
+#       absence (a node hosting 0 guests in that L3 domain legitimately has no
+#       FDB entry) using control-plane evidence + a data-plane probe.
+#    3. Stale/phantom zebra route advertised into BGP but absent from kernel
+#       FIB (RIB/FIB mismatch).
+#    4. BGP/EVPN session not Established (node peers = FAIL; backup firewall
+#       with FRR down = WARN, since that is an expected degraded state).
+#    + MTU mismatch (underlay must exceed overlay by >= 50B), NIC errors/drops,
+#      optic/DOM alarms, interface flapping, bond/LACP health, ECMP presence.
+#
+#  EXIT CODES (Nagios/monitoring convention -- feeds LibreNMS/Zabbix/CI)
+#    0 = OK      all checks passed
+#    1 = WARN    at least one WARN, no FAIL
+#    2 = CRIT    at least one FAIL (CRITICAL)
+#    3 = UNKNOWN dependency/usage error, or a node was UNREACHABLE
+#
+#  USAGE
+#    pve-sdn-healthcheck [options]
+#      --node a,b,c        only these nodes (host/IP); default: auto (pvecm/.members)
+#      --only underlay|overlay   run only one layer (default: both)
+#      --check NAME[,NAME] run only named checks (see --list-checks)
+#      --explain CHECK     print what a check validates / why / fix, then exit
+#      -a, --all           also show OK lines (default: hide OK, show WARN/FAIL)
+#      --json              emit machine-readable JSON (schema_version 1.0)
+#      --quiet             reserved for monitoring wrappers (suppress decoration)
+#      --no-color          disable ANSI colour (also auto-off when not a TTY)
+#      --list-checks       print the check catalogue and exit
+#      --fix [CHECKS]      PREVIEW safe auto-remediations (default: all allow-listed)
+#      --apply             execute the previewed fixes (root; implies --fix)
+#      -y, --yes           skip the apply confirmation (required non-interactively)
+#      --local             INTERNAL: run on the current host & emit machine records
+#      -h, --help          this help        -v, --version   print version
+#
+#  SAFE AUTO-FIX (opt-in) -- allow-listed, idempotent, logged to
+#    /var/log/pve-sdn-healthcheck-fix.log.  ONLY: ip_forward (set+persist),
+#    vmnic_plumbing (delegates to pve-vmnic-fix), frr_daemon (enable at boot).
+#    BGP/EVPN, zebra/FRR restart, MTU, optics, bonds are NEVER auto-fixed.
+#
+#  CONFIG  (override via env or /etc/pve-sdn-healthcheck.conf -- a sourced file).
+#    Everything auto-discovers; these are OPTIONAL overrides:
+#    SDN_NODES, SDN_SSH_OPTS, SDN_VTEPS, SDN_FW_MASTER, SDN_FW_BACKUP,
+#    SDN_L3VNIS, SDN_MTU_DELTA (default 50), SDN_VRF_PROBES.
+#
+#  REQUIREMENTS
+#    Controller: bash, ssh.  Each node: vtysh (FRR), iproute2, sysctl.
+#    Optional (graceful skip if absent): ethtool, jq, journalctl, pve-vmnic-fix.
+#    Run as root (vtysh/ethtool need it); key-based SSH to nodes assumed.
+# =============================================================================
+
+# NOTE: -e is intentionally NOT set: checks deliberately run commands that may
+# exit non-zero (that is how they detect faults).  pipefail keeps pipe status.
+set -o pipefail
+VERSION="1.0.0"
+
+# ----------------------------- defaults / config -----------------------------
+# PORTABLE BY DEFAULT: every site-specific entity is AUTO-DISCOVERED at runtime
+# (see discover_local / discover_nodes).  All variables below are OPTIONAL
+# overrides -- leave empty to learn them from the live cluster, so the script
+# runs unmodified on any PVE + FRR/EVPN environment.  Pin a value only to
+# enforce stricter checking (e.g. name the master firewall peer for FAIL).
+: "${SDN_NODES:=}"          # controller: node host/IPs to iterate (auto: pvecm)
+: "${SDN_SSH_OPTS:=}"       # extra ssh opts (ProxyJump, IdentityFile, ...)
+: "${SDN_VTEPS:=}"          # remote VTEP IPs (auto: EVPN BGP summary peers)
+: "${SDN_FW_MASTER:=}"      # OPTIONAL: pin master external peer -> down = FAIL
+: "${SDN_FW_BACKUP:=}"      # OPTIONAL: pin backup external peer -> down = WARN
+: "${SDN_L3VNIS:=}"         # "vrfvx_if:vrf:vni ..." (auto: 'show evpn vni')
+: "${SDN_MTU_DELTA:=50}"    # required underlay-over-overlay headroom (IPv4 VXLAN=50, v6=70)
+: "${SDN_VRF_PROBES:=}"     # OPTIONAL "vrf:probe_ip ..." for strict data-plane test
+[ -r /etc/pve-sdn-healthcheck.conf ] && . /etc/pve-sdn-healthcheck.conf
+
+SSH_BASE_OPTS="-o BatchMode=yes -o ConnectTimeout=6 -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new"
+FIX_LOG="/var/log/pve-sdn-healthcheck-fix.log"
+# Checks with a SAFE, bounded, idempotent auto-remediation (everything else is
+# advisory only and must be fixed by a human).
+FIX_ALLOWLIST="ip_forward vmnic_plumbing frr_daemon"
+
+# ----------------------------- option parsing --------------------------------
+MODE=controller; ONLY=""; ONLY_CHECKS=""; JSON=0; QUIET=0; NOCOLOR=0; SHOW_OK=0
+FIX_MODE=0; FIX_YES=0; FIX_CHECKS=""; EXPLAIN=""
+SEL_NODES=""
+usage() { sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; }
+list_checks() {
+  cat <<'L'
+UNDERLAY  ip_forward        IPv4 forwarding runtime + persistence
+UNDERLAY  frr_daemon        FRR active/enabled + vtysh reachable
+UNDERLAY  iface_link        Physical/uplink link state + carrier
+UNDERLAY  iface_errors      NIC rx/tx errors, drops, CRC (delta sample)
+UNDERLAY  iface_flap        Link flapping (carrier_changes + recent log + live)
+UNDERLAY  optics_dom        SFP/QSFP DOM temp/voltage/Tx/Rx vs alarms
+UNDERLAY  bond_lacp         Bond/LACP aggregator + slave state
+UNDERLAY  mtu_local         underlay transport MTU >= overlay MTU + delta
+UNDERLAY  bgp_evpn          Internal EVPN fabric sessions Established (node VTEPs)
+UNDERLAY  bgp_external      External peering per-VRF, IPv4+IPv6 unicast
+UNDERLAY  vtep_reach        Underlay reachability to all discovered VTEPs
+UNDERLAY  ceph_net          Ceph mon quorum + health (network-affecting)
+OVERLAY   evpn_vnis         Expected L2/L3 VNIs present & up
+OVERLAY   evpn_routes       EVPN type-2/3/5 routes populated per active VNI
+OVERLAY   irb_gw            Anycast gateway / IRB SVIs up
+OVERLAY   l3vni_fdb         L3-VNI FDB VTEPs (black-hole vs benign on-demand)
+OVERLAY   rib_fib           RIB/FIB consistency (no phantom advertised routes)
+OVERLAY   vrf_reach         Per-VRF external/data-plane reachability probe
+PLUMBING  vmnic_plumbing    Guest NIC bridge plumbing intact (mirrors pve-vmnic-fix)
+L
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) MODE=local ;;
+    --node) SEL_NODES="${2//,/ }"; shift ;;
+    --only) ONLY="$2"; shift ;;
+    --check) ONLY_CHECKS="${2//,/ }"; shift ;;
+    --explain) EXPLAIN="${2:-}"; shift ;;
+    --fix) FIX_MODE=1; [ -n "${2:-}" ] && case "$2" in -*) ;; *) FIX_CHECKS="${2//,/ }"; shift;; esac ;;
+    --apply) FIX_MODE=2 ;;
+    --yes|-y) FIX_YES=1 ;;
+    -a|--all) SHOW_OK=1 ;;
+    --json) JSON=1 ;;
+    --quiet) QUIET=1 ;;
+    --no-color) NOCOLOR=1 ;;
+    --list-checks) list_checks; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "pve-sdn-healthcheck $VERSION"; exit 0 ;;
+    *) echo "unknown option: $1 (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+[ -n "$SEL_NODES" ] && SDN_NODES="$SEL_NODES"
+# --apply implies --fix; a bare --fix is preview-only.
+[ "$FIX_MODE" = 2 ] && : ; { [ "$FIX_MODE" -ge 1 ] && [ -z "$FIX_CHECKS" ]; } && FIX_CHECKS="$FIX_ALLOWLIST"
+
+# ----------------------------- colour helpers --------------------------------
+setup_colors() {
+  if [ -t 1 ] && [ "$NOCOLOR" != "1" ] && command -v tput >/dev/null 2>&1; then
+    RED=$(tput setaf 1); GRN=$(tput setaf 2); YLW=$(tput setaf 3)
+    BLU=$(tput setaf 4); BLD=$(tput bold); NC=$(tput sgr0)
+  else RED=""; GRN=""; YLW=""; BLU=""; BLD=""; NC=""; fi
+}
+setup_colors
+
+# ----------------------------- record model ----------------------------------
+# A "record" is one check result.  In --local mode each is printed as a
+# tab-delimited line prefixed __REC__ so the controller can parse it without jq.
+#   __REC__ <SEV> <LAYER> <CHECK> <MESSAGE> <HINT>
+# __DATA__ lines carry per-node values used for cluster-wide cross-checks.
+WORST=0   # 0 ok / 1 warn / 2 fail   (local-host worst severity)
+sev_rank() { case "$1" in OK) echo 0;; WARN) echo 1;; FAIL) echo 2;; *) echo 0;; esac; }
+record() { # <SEV> <LAYER> <CHECK> <MESSAGE> [HINT] [FIXABLE]
+  local sev="$1" layer="$2" chk="$3" msg="$4" hint="${5:-}" fix="${6:-0}"
+  local r; r=$(sev_rank "$sev"); [ "$r" -gt "$WORST" ] && WORST=$r
+  # US (0x1f) field separator: non-whitespace, so `read` preserves empty fields.
+  printf '__REC__\037%s\037%s\037%s\037%s\037%s\037%s\n' "$sev" "$layer" "$chk" "$msg" "$hint" "$fix"
+}
+data() { printf '__DATA__\037%s\037%s\n' "$1" "$2"; }       # <key> <value>
+want_check() { [ -z "$ONLY_CHECKS" ] && return 0; case " $ONLY_CHECKS " in *" $1 "*) return 0;; *) return 1;; esac; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ----------------------------- fix automation --------------------------------
+# SAFE, opt-in, idempotent remediation only.  A check registers a fix ONLY if
+# (a) it is in FIX_ALLOWLIST and (b) the operator selected it via --fix.
+# --fix previews; --apply executes (root, logged).  Anything not allow-listed
+# (BGP, zebra/FRR restart, MTU, optics, bonds...) is advisory-only by design.
+declare -a FIX_QUEUE
+register_fix() { # <check> <human-description> <fn> [arg]
+  case " $FIX_ALLOWLIST " in *" $1 "*) ;; *) return;; esac
+  [ "$FIX_MODE" -ge 1 ] || return
+  case " $FIX_CHECKS " in *" $1 "*) ;; *) return;; esac
+  FIX_QUEUE+=("$1|$2|$3|${4:-}")
+}
+fix_ip_forward() {
+  sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.forwarding=1 net.ipv4.conf.default.forwarding=1 >/dev/null 2>&1
+  local f=/etc/sysctl.d/99-evpn-ip-forward.conf
+  [ -f "$f" ] && cp -p "$f" "$f.bak" 2>/dev/null
+  printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.forwarding=1\nnet.ipv4.conf.default.forwarding=1\n' > "$f" 2>/dev/null
+  [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = 1 ]
+}
+fix_frr_daemon() { systemctl enable frr >/dev/null 2>&1; }   # boot persistence only, NO restart
+fix_vmnic_plumbing() { have pve-vmnic-fix && pve-vmnic-fix "$1" >/dev/null 2>&1; }
+run_fixes() {
+  [ "$FIX_MODE" -ge 1 ] || return
+  if [ "${#FIX_QUEUE[@]}" -eq 0 ]; then printf '__FIX__\037NONE\037-\037no auto-fixable issues on this node\n'; return; fi
+  local item chk desc fn arg
+  for item in "${FIX_QUEUE[@]}"; do
+    IFS='|' read -r chk desc fn arg <<< "$item"
+    if [ "$FIX_MODE" = 1 ]; then printf '__FIX__\037PREVIEW\037%s\037%s\n' "$chk" "$desc"; continue; fi
+    if [ "$(id -u)" != 0 ]; then printf '__FIX__\037DENIED\037%s\037root required to apply\n' "$chk"; continue; fi
+    echo "$(date -Is 2>/dev/null) $(hostname) APPLY $chk :: $desc" >> "$FIX_LOG" 2>/dev/null
+    if "$fn" $arg; then printf '__FIX__\037APPLIED\037%s\037%s\n' "$chk" "$desc"
+    else printf '__FIX__\037FAILED\037%s\037%s\n' "$chk" "$desc"; fi
+  done
+}
+
+# ----------------------------- --explain registry ----------------------------
+explain() {
+  case "$1" in
+    ip_forward) cat <<'X'
+ip_forward  (UNDERLAY, auto-fixable)
+  WHAT  IPv4 forwarding at runtime AND persisted in /etc/sysctl.d.
+  WHY   An EVPN node must route between the external peering interface and the
+        VXLAN overlay; ip_forward=0 black-holes all north/south transit.
+  WARN  runtime=1 but not persisted (will reset on reboot).
+  FAIL  forwarding disabled.   FIX  --fix ip_forward  (then --apply).
+X
+;;
+    l3vni_fdb) cat <<'X'
+l3vni_fdb  (OVERLAY)
+  WHAT  L3-VNI VXLAN FDB has the remote router-MAC -> VTEP entries.
+  WHY   Symmetric-IRB routes encapsulate to the peer's VTEP via this FDB; a
+        missing entry on a transit node silently black-holes routed traffic.
+  OK    entries present, OR node is idle in the VRF (benign on-demand absence).
+  WARN  empty + local demand but no probe target to confirm (set SDN_VRF_PROBES).
+  FAIL  empty + demand + data-plane probe fails  -> real black-hole.
+X
+;;
+    vmnic_plumbing) cat <<'X'
+vmnic_plumbing  (PLUMBING, auto-fixable via pve-vmnic-fix)
+  WHAT  Each running guest's NIC chain tap/veth -> fwbr/fwpr/fwln -> vnet/vmbr.
+  WHY   A lost bridge master or an fwbr stuck LOWERLAYERDOWN isolates that guest.
+  FAIL  detached master / LOWERLAYERDOWN.   FIX  --fix vmnic_plumbing (--apply
+        delegates to pve-vmnic-fix <vmid>).
+X
+;;
+    bgp_evpn) echo "bgp_evpn (UNDERLAY): internal EVPN fabric (node<->node VTEP, L2VPN-EVPN AF). Any peer not Established = FAIL. Advisory only.";;
+    bgp_external) echo "bgp_external (UNDERLAY): per-VRF firewall/external peering, IPv4+IPv6 unicast. Master down/all-down = FAIL, redundant/backup or one-AF down = WARN. Advisory only.";;
+    mtu_local) echo "mtu_local (UNDERLAY): VXLAN transport MTU must be >= overlay MTU + ${SDN_MTU_DELTA} (IPv4) so encapsulated frames don't fragment. Advisory only.";;
+    rib_fib) echo "rib_fib (OVERLAY): FRR routes 'selected' but not 'installed' in the kernel FIB = stuck/phantom zebra state. Advisory (restart zebra is a human decision).";;
+    *) echo "No detailed explanation for '$1'. Run --list-checks for the catalogue.";;
+  esac
+}
+
+# =============================================================================
+#  LOCAL CHECKS  (executed on each node; emit records only)
+# =============================================================================
+
+# Auto-detect physical NICs (have a PCI/USB device), underlay iface (carries a
+# VTEP IP), and overlay vxlan ifaces.
+detect_ifaces() {
+  PHYS_NICS=""
+  for n in /sys/class/net/*; do
+    ifc=$(basename "$n"); [ -e "$n/device" ] || continue
+    PHYS_NICS="$PHYS_NICS $ifc"
+  done
+  VXLAN_IFS=$(ip -d -o link show type vxlan 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | tr '\n' ' ')
+}
+
+# Learn this node's site-specific entities from the live system so the script
+# needs NO hardcoded IPs/VNIs.  Any value already set (env/conf) is respected.
+discover_local() {
+  # Is this an overlay/SDN node at all?  (VXLAN ifaces present, or FRR running
+  # with EVPN VNIs.)  Non-SDN PVE nodes legitimately have no FRR / ip_forward /
+  # overlay -- so those checks must be skipped, not failed.
+  IS_SDN=0
+  if [ -n "$VXLAN_IFS" ]; then IS_SDN=1
+  elif systemctl is-active frr >/dev/null 2>&1 && vtysh -c 'show evpn vni' 2>/dev/null | grep -qwE 'L2|L3'; then IS_SDN=1; fi
+  data IS_SDN "$IS_SDN"
+  [ "$IS_SDN" = 1 ] || return
+  # L3 VNIs as "vxlan_iface:tenant_vrf:vni"; fall back to the kernel vxlan iface
+  # when FRR prints the VxLAN-IF column as "None".
+  if [ -z "$SDN_L3VNIS" ]; then
+    SDN_L3VNIS=$(vtysh -c 'show evpn vni' 2>/dev/null | awk '$2=="L3"{print $1, $3, $NF}' | while read -r vni vif vrf; do
+        if [ "$vif" = None ] || [ -z "$vif" ]; then
+          vif=$(ip -d -o link show type vxlan 2>/dev/null | awk -v id="id $vni " 'index($0,id){print $2}' | sed 's/[:@].*//' | head -1)
+        fi
+        [ -n "$vif" ] && [ "$vif" != None ] && echo "$vif:$vrf:$vni"
+      done | tr '\n' ' ')
+  fi
+  # Remote VTEP underlay IPs = the EVPN-fabric BGP peers.
+  if [ -z "$SDN_VTEPS" ]; then
+    SDN_VTEPS=$(vtysh -c 'show bgp l2vpn evpn summary' 2>/dev/null | _bgp_peers | awk '{print $1}' | sort -u | tr '\n' ' ')
+  fi
+}
+
+chk_ip_forward() {
+  want_check ip_forward || return
+  if [ "${IS_SDN:-0}" != 1 ]; then
+    record OK UNDERLAY ip_forward "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) (non-overlay node; routing not required)"; return
+  fi
+  local f a d; f=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+  a=$(sysctl -n net.ipv4.conf.all.forwarding 2>/dev/null)
+  d=$(sysctl -n net.ipv4.conf.default.forwarding 2>/dev/null)
+  if [ "$f" = 1 ] && [ "$a" = 1 ]; then
+    # runtime ok -> check persistence
+    if grep -RqsE '^\s*net\.ipv4\.(ip_forward|conf\.all\.forwarding)\s*=\s*1' /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null; then
+      record OK UNDERLAY ip_forward "forwarding runtime=1 and persisted"
+    else
+      record WARN UNDERLAY ip_forward "forwarding runtime=1 but NOT persisted (will reset on reboot)" \
+        "Add net.ipv4.ip_forward=1 and conf.all.forwarding=1 to /etc/sysctl.d/99-evpn-ip-forward.conf"
+    fi
+  else
+    record FAIL UNDERLAY ip_forward "ip_forward=$f all.forwarding=$a default=$d -> overlay<->external transit BLACK-HOLED" \
+      "sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.forwarding=1 ; then persist in /etc/sysctl.d/" 1
+    register_fix ip_forward "set + persist net.ipv4.ip_forward=1 (+conf.all/default.forwarding)" fix_ip_forward
+  fi
+}
+
+chk_frr_daemon() {
+  want_check frr_daemon || return
+  local act ena; act=$(systemctl is-active frr 2>/dev/null); ena=$(systemctl is-enabled frr 2>/dev/null)
+  if [ "${IS_SDN:-0}" != 1 ] && [ "$act" != active ]; then
+    record OK UNDERLAY frr_daemon "no FRR/overlay on this node - skipped"; return
+  fi
+  if [ "$act" = active ] && vtysh -c 'show version' >/dev/null 2>&1; then
+    if [ "$ena" = enabled ]; then
+      record OK UNDERLAY frr_daemon "FRR active, enabled, vtysh OK ($(vtysh -c 'show version' 2>/dev/null|awk '/FRRouting/{print $2,$3;exit}'))"
+    else
+      record WARN UNDERLAY frr_daemon "FRR active but NOT enabled at boot" "systemctl enable frr" 1
+      register_fix frr_daemon "systemctl enable frr (enable at boot; no restart)" fix_frr_daemon
+    fi
+  else
+    record FAIL UNDERLAY frr_daemon "FRR not healthy (active=$act, vtysh failed) -> no overlay routing" \
+      "systemctl status frr ; journalctl -u frr -n50 ; systemctl restart frr"
+  fi
+}
+
+chk_iface_link() {
+  want_check iface_link || return
+  local any=0
+  for ifc in $PHYS_NICS; do
+    local oper carrier; oper=$(cat /sys/class/net/$ifc/operstate 2>/dev/null)
+    carrier=$(cat /sys/class/net/$ifc/carrier 2>/dev/null)
+    # only flag NICs that are administratively up
+    [ "$(cat /sys/class/net/$ifc/flags 2>/dev/null)" ] || continue
+    if ip link show "$ifc" 2>/dev/null | grep -q 'state UP\|LOWER_UP'; then
+      any=1
+      if [ "$carrier" = 1 ]; then record OK UNDERLAY iface_link "$ifc up, carrier present"
+      else record FAIL UNDERLAY iface_link "$ifc admin-up but NO carrier (operstate=$oper)" \
+        "Check cabling/SFP/switchport for $ifc"; fi
+    fi
+  done
+  [ "$any" = 0 ] && record WARN UNDERLAY iface_link "no admin-up physical NIC detected (virtual node?)"
+}
+
+chk_iface_errors() {
+  want_check iface_errors || return
+  for ifc in $PHYS_NICS; do
+    ip link show "$ifc" 2>/dev/null | grep -q 'LOWER_UP' || continue
+    local rxe txe; rxe=$(cat /sys/class/net/$ifc/statistics/rx_errors 2>/dev/null||echo 0)
+    txe=$(cat /sys/class/net/$ifc/statistics/tx_errors 2>/dev/null||echo 0)
+    local rxd; rxd=$(cat /sys/class/net/$ifc/statistics/rx_dropped 2>/dev/null||echo 0)
+    if [ "${rxe:-0}" -gt 10 ] || [ "${txe:-0}" -gt 10 ]; then
+      record FAIL UNDERLAY iface_errors "$ifc rx_err=$rxe tx_err=$txe (hard errors)" \
+        "ethtool -S $ifc | grep -iE 'err|crc|fcs|fec' ; inspect cabling/optic/switchport"
+    elif [ "${rxd:-0}" -gt 1000 ]; then
+      record WARN UNDERLAY iface_errors "$ifc rx_dropped=$rxd (soft drops)" "ethtool -S $ifc ; check ring/buffer & offloads"
+    else
+      record OK UNDERLAY iface_errors "$ifc clean (rx_err=$rxe tx_err=$txe drop=$rxd)"
+    fi
+  done
+}
+
+chk_iface_flap() {
+  want_check iface_flap || return
+  for ifc in $PHYS_NICS; do
+    ip link show "$ifc" 2>/dev/null | grep -q 'LOWER_UP' || continue
+    local cc; cc=$(cat /sys/class/net/$ifc/carrier_changes 2>/dev/null||echo 0)
+    local recent=0
+    if have journalctl; then recent=$(journalctl -k --since '-24 hours' --no-pager 2>/dev/null | grep -ciE "$ifc.*(Link is Down|link down|carrier lost)"); fi
+    # carrier_changes accumulates over uptime (a clean boot is ~2-4), so weight
+    # RECENT down events; only treat very high lifetime churn as a signal.
+    if ! ip link show "$ifc" 2>/dev/null | grep -q 'LOWER_UP' || [ "${recent:-0}" -ge 3 ]; then
+      record FAIL UNDERLAY iface_flap "$ifc flapping/down (carrier_changes=$cc, ${recent} down events/24h)" \
+        "Suspect cabling/optic/switchport; ethtool -S $ifc; check switch logs"
+    elif [ "${recent:-0}" -ge 1 ] || [ "${cc:-0}" -ge 20 ]; then
+      record WARN UNDERLAY iface_flap "$ifc link churn (carrier_changes=$cc, ${recent} down/24h)" "Monitor $ifc; correlate with switch logs"
+    else
+      record OK UNDERLAY iface_flap "$ifc stable (carrier_changes=$cc)"
+    fi
+  done
+}
+
+chk_optics_dom() {
+  want_check optics_dom || return
+  have ethtool || { record OK UNDERLAY optics_dom "ethtool absent - skipped"; return; }
+  local found=0
+  for ifc in $PHYS_NICS; do
+    # Only assess optics on links that are actually UP (carrier present).  A
+    # dark/unused port legitimately raises LOS/low-power alarms -- not a fault.
+    [ "$(cat /sys/class/net/$ifc/carrier 2>/dev/null)" = 1 ] || continue
+    local m; m=$(ethtool -m "$ifc" 2>/dev/null) || continue
+    [ -z "$m" ] && continue
+    echo "$m" | grep -qiE 'Operation not supported|No module' && continue
+    found=1
+    # Vendor alarm flags first: a line like "... high alarm : On" = asserted.
+    if echo "$m" | grep -qiE ' alarm[[:space:]]*:[[:space:]]*On'; then
+      local al; al=$(echo "$m" | grep -iE ' alarm[[:space:]]*:[[:space:]]*On' | sed 's/[[:space:]]*:.*//; s/^[[:space:]]*//' | paste -sd, - 2>/dev/null)
+      record FAIL UNDERLAY optics_dom "$ifc optic ALARM asserted: ${al:-see ethtool -m}" \
+        "ethtool -m $ifc ; check optic power/temp, clean or replace the transceiver"
+      continue
+    fi
+    local temp rx
+    temp=$(echo "$m" | awk -F: '/Module temperature/{print $2;exit}' | grep -oE '\-?[0-9]+\.?[0-9]*' | head -1)
+    rx=$(echo "$m" | awk -F: '/Rcvr signal avg optical power|Receiver signal average optical power/{print $2;exit}' | grep -oE '\-?[0-9.]+ *dBm' | grep -oE '\-?[0-9.]+' | head -1)
+    local msg="$ifc optic"; local sev=OK
+    [ -n "$temp" ] && { msg="$msg temp=${temp}C"; awk "BEGIN{exit !($temp>80||$temp<-5)}" && sev=FAIL; awk "BEGIN{exit !($temp>70&&$temp<=80)}" && [ "$sev" = OK ] && sev=WARN; }
+    [ -n "$rx" ] && { msg="$msg Rx=${rx}dBm"; awk "BEGIN{exit !($rx< -14)}" && sev=FAIL; awk "BEGIN{exit !($rx>=-14 && $rx< -12)}" && [ "$sev" = OK ] && sev=WARN; }
+    record "$sev" UNDERLAY optics_dom "$msg" "$([ "$sev" = OK ] || echo "ethtool -m $ifc ; check optic budget/temp")"
+  done
+  [ "$found" = 0 ] && record OK UNDERLAY optics_dom "no DOM-capable optics present (copper/virtual) - skipped"
+}
+
+chk_bond_lacp() {
+  want_check bond_lacp || return
+  local bonds; bonds=$(ls /proc/net/bonding/ 2>/dev/null)
+  [ -z "$bonds" ] && { record OK UNDERLAY bond_lacp "no bonds configured - skipped"; return; }
+  for b in $bonds; do
+    local f=/proc/net/bonding/$b
+    local down; down=$(grep -c 'MII Status: down' "$f" 2>/dev/null)
+    local slaves; slaves=$(grep -c 'Slave Interface' "$f" 2>/dev/null)
+    local agg_ok=1; grep -q 'Aggregator' "$f" && grep -q 'Partner Mac Address: 00:00:00:00:00:00' "$f" && agg_ok=0
+    if grep -q 'MII Status: up' "$f" && [ "${down:-0}" -eq 0 ] && [ "$agg_ok" = 1 ]; then
+      record OK UNDERLAY bond_lacp "$b up, $slaves slaves, no LACP issues"
+    elif grep -q 'MII Status: up' "$f"; then
+      record WARN UNDERLAY bond_lacp "$b up but $down slave(s) down or LACP partner issue" "cat $f ; check switch LACP/port-channel"
+    else
+      record FAIL UNDERLAY bond_lacp "$b DOWN / no active aggregator" "cat $f ; check both uplinks and switch bonding"
+    fi
+  done
+}
+
+chk_mtu() {
+  want_check mtu_local || want_check mtu_cluster || return
+  [ -z "$VXLAN_IFS" ] && { record OK UNDERLAY mtu_local "no VXLAN overlay on this node - MTU check N/A"; return; }
+  # overlay MTU = max over VXLAN ifaces (tenant frame size)
+  local max_o=0 m i
+  for i in $VXLAN_IFS; do m=$(cat /sys/class/net/$i/mtu 2>/dev/null||echo 1500); [ "$m" -gt "$max_o" ] && max_o=$m; done
+  # underlay transport MTU = egress iface of the ROUTE to a remote VTEP (the
+  # real VXLAN-carrying path), NOT every iface that happens to hold a .203 IP
+  # (firewall-peering VLANs share that subnet but are not the VXLAN underlay).
+  local dev="" umtu=0 v
+  for v in $SDN_VTEPS $SDN_FW_MASTER; do
+    dev=$(ip -o route get "$v" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -1)
+    { [ -z "$dev" ] || [ "$dev" = lo ]; } && { dev=""; continue; }
+    echo " $VXLAN_IFS " | grep -q " $dev " && { dev=""; continue; }   # local VTEP, skip
+    umtu=$(cat /sys/class/net/$dev/mtu 2>/dev/null||echo 0); [ "${umtu:-0}" -gt 0 ] && break
+  done
+  [ "${umtu:-0}" = 0 ] && { record WARN UNDERLAY mtu_local "could not determine underlay transport iface for VXLAN" "set the VTEP egress iface MTU manually and verify >= overlay+$SDN_MTU_DELTA"; return; }
+  data MTU_UNDERLAY "$umtu"; data MTU_OVERLAY "$max_o"
+  if want_check mtu_local; then
+    if [ "$max_o" -gt 0 ] && [ "$umtu" -lt $((max_o + SDN_MTU_DELTA)) ]; then
+      record FAIL UNDERLAY mtu_local "underlay transport $dev MTU $umtu < overlay $max_o + $SDN_MTU_DELTA -> VXLAN frames fragment/drop" \
+        "Raise $dev (and the switch port) to jumbo >= $((max_o + SDN_MTU_DELTA))"
+    else
+      record OK UNDERLAY mtu_local "MTU headroom OK (underlay $dev=$umtu >= overlay $max_o + $SDN_MTU_DELTA)"
+    fi
+  fi
+}
+
+# BGP is checked as TWO distinct session classes, because a healthy overlay
+# needs both and they live in different tables:
+#   (a) bgp_evpn      = internal fabric: node<->node VTEP sessions in the
+#                       L2VPN-EVPN AF (default VRF).  Any down = FAIL.
+#   (b) bgp_external  = North/South peering to the firewalls, which lives in
+#                       the per-VRF IPv4 *and* IPv6 unicast AFs (vrf_SDCVPN01 /
+#                       vrf_L01VPN01).  Master FW down = FAIL; backup FW down =
+#                       WARN; a peer up in one AF but down in the other (v4/v6
+#                       multiprotocol mismatch) = WARN.
+# Parse any 'show bgp ... summary' into "IP STATE" lines.  Robust to FRR
+# printing the Neighbor as hostname(IP) (show-hostname) and to a trailing
+# Desc column: the State/PfxRcd value is ALWAYS column 10 from the left
+# (Neighbor V AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd ...).
+_bgp_peers() {
+  awk 'NF>=10 {
+    ip=$1; sub(/.*\(/,"",ip); sub(/\).*/,"",ip)
+    if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || ip ~ /:.*:/) print ip, $10
+  }'
+}
+chk_bgp_evpn() {
+  want_check bgp_evpn || return
+  vtysh -c 'show version' >/dev/null 2>&1 || { record FAIL UNDERLAY bgp_evpn "vtysh unavailable"; return; }
+  local down="" n=0 ip state
+  while read -r ip state; do
+    n=$((n+1)); echo "$state" | grep -qE '^[0-9]+$' || down="$down $ip($state)"
+  done < <(vtysh -c 'show bgp l2vpn evpn summary' 2>/dev/null | _bgp_peers)
+  if [ "$n" = 0 ]; then record WARN UNDERLAY bgp_evpn "no EVPN fabric peers found (not an EVPN node?)" "vtysh -c 'show bgp l2vpn evpn summary'"
+  elif [ -n "$down" ]; then record FAIL UNDERLAY bgp_evpn "EVPN fabric peers NOT Established:$down" "check FRR + underlay reachability to that VTEP"
+  else record OK UNDERLAY bgp_evpn "EVPN fabric: all $n node peers Established"; fi
+}
+chk_bgp_external() {
+  want_check bgp_external || return
+  vtysh -c 'show version' >/dev/null 2>&1 || return
+  local fails="" warns="" seen_af=0
+  declare -A AFUP
+  for tuple in $SDN_L3VNIS; do
+    local vrf="${tuple#*:}"; vrf="${vrf%:*}"; [ -z "$vrf" ] && continue
+    for af in ipv4 ipv6; do
+      local sum; sum=$(vtysh -c "show bgp vrf $vrf $af unicast summary" 2>/dev/null)
+      echo "$sum" | grep -qiE 'Neighbor|neighbors' || continue
+      seen_af=1
+      local total=0 up=0
+      while read -r ip state; do
+        echo "$ip" | grep -qiE '^[0-9a-f.:]+$' || continue
+        total=$((total+1)); local o=0; echo "$state" | grep -qE '^[0-9]+$' && o=1
+        AFUP["$vrf|$ip|$af"]=$o; [ "$o" = 1 ] && up=$((up+1))
+        if [ "$o" = 0 ]; then
+          if [ -n "$SDN_FW_MASTER" ] && [ "$ip" = "$SDN_FW_MASTER" ]; then fails="$fails $vrf/$af:MASTER($ip)"
+          elif [ -n "$SDN_FW_BACKUP" ] && [ "$ip" = "$SDN_FW_BACKUP" ]; then warns="$warns $vrf/$af:backup($ip)"
+          else warns="$warns $vrf/$af:$ip($state)"; fi
+        fi
+      done < <(echo "$sum" | _bgp_peers)
+      # Auto-severity when no master is pinned: ALL external peers down in a
+      # VRF/AF means that tenant has NO North/South path -> FAIL.
+      [ -z "$SDN_FW_MASTER" ] && [ "$total" -gt 0 ] && [ "$up" -eq 0 ] && fails="$fails $vrf/$af:ALL-EXT-DOWN($total)"
+    done
+  done
+  # v4-up/v6-down (or vice-versa) multiprotocol mismatch per peer
+  local k; for k in "${!AFUP[@]}"; do
+    case "$k" in *"|ipv4") local b="${k%|ipv4}|ipv6"; [ "${AFUP[$k]}" = 1 ] && [ -n "${AFUP[$b]+x}" ] && [ "${AFUP[$b]}" = 0 ] && warns="$warns ${k%|ipv4}(v4up/v6down)";; esac
+  done
+  if [ "$seen_af" = 0 ]; then record OK UNDERLAY bgp_external "no external per-VRF BGP peering present - skipped"
+  elif [ -n "$fails" ]; then record FAIL UNDERLAY bgp_external "external peering DOWN:$fails" "vtysh 'show bgp vrf <vrf> ipv4|ipv6 unicast summary'; check the external/firewall router FRR + peering link"
+  elif [ -n "$warns" ]; then record WARN UNDERLAY bgp_external "external peering degraded:$warns (redundant peer or one AF down)" "verify external/firewall FRR + that BOTH v4 and v6 AFs are Established"
+  else record OK UNDERLAY bgp_external "external per-VRF peering Established (all peers, v4+v6)"; fi
+}
+
+chk_vtep_reach() {
+  want_check vtep_reach || return
+  [ -z "$SDN_VTEPS" ] && { record OK UNDERLAY vtep_reach "no VTEP peers discovered - skipped"; return; }
+  local fails="" n=0 v
+  for v in $SDN_VTEPS; do
+    n=$((n+1)); ping -c2 -W2 "$v" >/dev/null 2>&1 || fails="$fails $v"
+  done
+  [ -n "$fails" ] && record FAIL UNDERLAY vtep_reach "unreachable underlay VTEP peers:$fails" "ping the VTEP; check underlay routing/MTU/physical" \
+    || record OK UNDERLAY vtep_reach "all $n discovered VTEP peers reachable"
+}
+
+chk_ceph_net() {
+  want_check ceph_net || return
+  have ceph || { record OK UNDERLAY ceph_net "not a ceph node - skipped"; return; }
+  local h; h=$(ceph health 2>/dev/null | awk '{print $1}')
+  [ -z "$h" ] && { record OK UNDERLAY ceph_net "ceph status not available from here - skipped"; return; }
+  if echo "$h" | grep -q HEALTH_ERR; then record FAIL UNDERLAY ceph_net "ceph $h" "ceph -s ; ceph health detail"
+  elif ceph -s 2>/dev/null | grep -qiE 'mon.*(down|out of quorum)'; then record FAIL UNDERLAY ceph_net "ceph mon quorum degraded (possible cluster-net issue)" "ceph -s ; check cluster network"
+  else record OK UNDERLAY ceph_net "ceph reachable ($h)"; fi
+}
+
+# ----------------------------- overlay checks --------------------------------
+chk_evpn_vnis() {
+  want_check evpn_vnis || return
+  local out; out=$(vtysh -c 'show evpn vni' 2>/dev/null)
+  local l3 l2 miss=""
+  l3=$(echo "$out" | awk '$2=="L3"{c++}END{print c+0}')
+  l2=$(echo "$out" | awk '$2=="L2"{c++}END{print c+0}')
+  # every L3 VNI FRR knows about must have its kernel vxlan iface (CP vs DP)
+  local tuple vif
+  for tuple in $SDN_L3VNIS; do
+    vif="${tuple%%:*}"; [ -n "$vif" ] && ! ip link show "$vif" >/dev/null 2>&1 && miss="$miss $vif"
+  done
+  if [ "$((l3+l2))" -eq 0 ]; then record WARN OVERLAY evpn_vnis "no EVPN VNIs present (not an EVPN node?)" "vtysh -c 'show evpn vni'"
+  elif [ -n "$miss" ]; then record FAIL OVERLAY evpn_vnis "FRR L3 VNI without kernel iface:$miss (control/data-plane mismatch)" "ifreload -a ; check SDN apply"
+  else record OK OVERLAY evpn_vnis "$l3 L3 + $l2 L2 VNIs present; kernel ifaces consistent"; fi
+}
+
+chk_evpn_routes() {
+  want_check evpn_routes || return
+  local rib; rib=$(vtysh -c 'show bgp l2vpn evpn summary' 2>/dev/null | grep -oE 'RIB entries [0-9]+' | grep -oE '[0-9]+' | head -1)
+  if [ -n "$rib" ] && [ "$rib" -gt 0 ] 2>/dev/null; then record OK OVERLAY evpn_routes "EVPN RIB populated ($rib entries)"
+  else record WARN OVERLAY evpn_routes "EVPN RIB empty/low (parsed='$rib')" "vtysh -c 'show bgp l2vpn evpn' ; verify peers advertising type-2/3/5"; fi
+}
+
+chk_irb_gw() {
+  want_check irb_gw || return
+  local down=""
+  for tuple in $SDN_L3VNIS; do
+    local vrf="${tuple#*:}"; vrf="${vrf%:*}"
+    ip link show "$vrf" >/dev/null 2>&1 || continue
+    ip -br link show "$vrf" 2>/dev/null | grep -qiE 'UP|UNKNOWN' || down="$down $vrf"
+  done
+  [ -n "$down" ] && record FAIL OVERLAY irb_gw "VRF/IRB device down:$down" "ip link set $down up ; check SDN apply" \
+    || record OK OVERLAY irb_gw "IRB/VRF devices up"
+}
+
+# The crown jewel: distinguish a real L3-VNI black-hole from benign on-demand
+# absence (see KNOWN FAILURE MODE #2).
+chk_l3vni_fdb() {
+  want_check l3vni_fdb || return
+  for tuple in $SDN_L3VNIS; do
+    local vif="${tuple%%:*}" vrf; vrf="${tuple#*:}"; vrf="${vrf%:*}"
+    ip link show "$vif" >/dev/null 2>&1 || { record OK OVERLAY l3vni_fdb "$vif not present - skipped"; continue; }
+    local vteps; vteps=$(bridge fdb show dev "$vif" 2>/dev/null | grep -oE 'dst [0-9.]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
+    # local demand for this VRF = live (resolved) neighbours in the VRF.  This
+    # is per-VRF accurate; a node with no active neighbours in the VRF has no
+    # need for peers' L3-VNI VTEP, so an empty FDB there is benign on-demand.
+    local nbrs; nbrs=$(ip neigh show vrf "$vrf" 2>/dev/null | grep -vE 'fe80:|FAILED|INCOMPLETE' | grep -c .)
+    if [ -n "$vteps" ]; then
+      record OK OVERLAY l3vni_fdb "$vif FDB VTEPs present:$vteps"
+    elif [ "${nbrs:-0}" -eq 0 ]; then
+      record OK OVERLAY l3vni_fdb "$vif no remote VTEP in FDB but node IDLE in $vrf (0 active neighbours) -> benign on-demand"
+    else
+      # local demand exists & FDB empty -> probe to decide
+      local pip=""
+      for pr in $SDN_VRF_PROBES; do [ "${pr%%:*}" = "$vrf" ] && pip="${pr#*:}"; done
+      if [ -n "$pip" ] && ip vrf exec "$vrf" ping -c2 -W2 "$pip" >/dev/null 2>&1; then
+        record WARN OVERLAY l3vni_fdb "$vif FDB empty but data-plane to $pip OK (transient/on-demand learning)" "Monitor; if recurring, pkill -9 -x zebra (watchfrr respawns) to re-import EVPN FDB"
+      elif [ -n "$pip" ]; then
+        record FAIL OVERLAY l3vni_fdb "$vif L3-VNI FDB empty + demand present + probe to $pip FAILS -> symmetric-IRB BLACK-HOLE" \
+          "Verify EVPN type-2/5 router-MAC; durable fix: restart zebra so it re-installs router-MAC->VTEP FDB"
+      else
+        record WARN OVERLAY l3vni_fdb "$vif FDB empty + demand present, UNRESOLVED (no probe target to confirm black-hole)" "set SDN_VRF_PROBES=\"$vrf:<inside-ip>\" so this can be asserted PASS/FAIL instead of WARN"
+      fi
+    fi
+  done
+}
+
+chk_rib_fib() {
+  want_check rib_fib || return
+  # Use FRR's OWN selected/installed flags (not a naive diff against the kernel,
+  # which false-positives on connected/local/EVPN-programmed routes).  A route
+  # FRR marks selected==true but installed!=true is a genuine FIB-programming
+  # failure -- the real "phantom/stuck zebra" signature.
+  have jq || { record OK OVERLAY rib_fib "jq absent - selected/installed check skipped"; return; }
+  local bad=""
+  for tuple in $SDN_L3VNIS; do
+    local vrf="${tuple#*:}"; vrf="${vrf%:*}"
+    local n; n=$(vtysh -c "show ip route vrf $vrf json" 2>/dev/null \
+      | jq '[.[][]? | select((.selected==true) and (.installed!=true) and (.protocol!="connected") and (.protocol!="local"))] | length' 2>/dev/null)
+    [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null && bad="$bad $vrf:${n}"
+  done
+  [ -n "$bad" ] && record WARN OVERLAY rib_fib "FRR routes selected but NOT installed in kernel:$bad" "vtysh 'show ip route vrf <v>' (look for queued/rejected); if a redistributed route is advertised yet absent from kernel, restart zebra" \
+    || record OK OVERLAY rib_fib "RIB/FIB consistent (all selected routes installed)"
+}
+
+chk_vrf_reach() {
+  want_check vrf_reach || return
+  [ -z "$SDN_VRF_PROBES" ] && { record OK OVERLAY vrf_reach "no SDN_VRF_PROBES configured - skipped"; return; }
+  local fails=""
+  for pr in $SDN_VRF_PROBES; do
+    local vrf="${pr%%:*}" ip="${pr#*:}"
+    ip vrf exec "$vrf" ping -c2 -W2 "$ip" >/dev/null 2>&1 || fails="$fails $vrf:$ip"
+  done
+  [ -n "$fails" ] && record FAIL OVERLAY vrf_reach "per-VRF probe FAILED:$fails" "ip vrf exec <vrf> ping <ip>; check IRB/FDB/forwarding" \
+    || record OK OVERLAY vrf_reach "all per-VRF data-plane probes OK"
+}
+
+# Mirror pve-vmnic-fix (READ-ONLY): verify each running guest's NIC plumbing
+# chain (tap/veth -> fwbr/fwpr/fwln -> vnet/vmbr) is intact.  A lost bridge
+# master or an fwbr stuck LOWERLAYERDOWN black-holes that guest's traffic -
+# exactly what pve-vmnic-fix repairs.  Here we only DETECT and point to it.
+#   https://github.com/ciroiriarte/pve-tools/blob/master/pve-vmnic-fix
+chk_vmnic_plumbing() {
+  want_check vmnic_plumbing || return
+  have qm || { record OK PLUMBING vmnic_plumbing "not a PVE node - skipped"; return; }
+  local broken=0 checked=0 guests=0 ids ent ty id cfg pfx
+  ids=$( { qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print "vm:"$1}'; \
+           pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print "ct:"$1}'; } )
+  for ent in $ids; do
+    ty="${ent%%:*}"; id="${ent#*:}"; guests=$((guests+1))
+    if [ "$ty" = vm ]; then cfg=$(qm config "$id" 2>/dev/null); pfx=tap; else cfg=$(pct config "$id" 2>/dev/null); pfx=veth; fi
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local idx br tap fwpr fwbr m
+      idx=$(echo "$line" | cut -d: -f1 | sed 's/net//')
+      br=$(echo "$line" | sed -e 's/.*bridge=\([^,]*\).*/\1/'); [ -z "$br" ] && continue
+      tap="${pfx}${id}i${idx}"; fwpr="fwpr${id}p${idx}"; fwbr="fwbr${id}i${idx}"
+      checked=$((checked+1))
+      if ip link show "$fwpr" >/dev/null 2>&1; then          # firewall chain
+        m=$(bridge link show dev "$fwpr" 2>/dev/null | grep -oE 'master [^ ]+' | awk '{print $2}')
+        if [ "$m" != "$br" ]; then
+          record FAIL PLUMBING vmnic_plumbing "$ty $id net$idx: $fwpr master='${m:-none}' != '$br' (detached) -> guest BLACK-HOLED" \
+            "pve-vmnic-fix $id   (preview: pve-vmnic-fix -n $id)" 1; broken=1
+          register_fix vmnic_plumbing "pve-vmnic-fix $id (repair guest $id NIC plumbing)" fix_vmnic_plumbing "$id"
+        elif ip link show "$fwbr" 2>/dev/null | grep -qE 'LOWERLAYERDOWN|NO-CARRIER|state DOWN'; then
+          record FAIL PLUMBING vmnic_plumbing "$ty $id net$idx: $fwbr LOWERLAYERDOWN -> guest BLACK-HOLED" "pve-vmnic-fix $id" 1; broken=1
+          register_fix vmnic_plumbing "pve-vmnic-fix $id (repair guest $id NIC plumbing)" fix_vmnic_plumbing "$id"
+        fi
+      elif ip link show "$tap" >/dev/null 2>&1; then          # direct attach
+        m=$(bridge link show dev "$tap" 2>/dev/null | grep -oE 'master [^ ]+' | awk '{print $2}')
+        if [ "$m" != "$br" ]; then
+          record FAIL PLUMBING vmnic_plumbing "$ty $id net$idx: $tap master='${m:-none}' != '$br' (detached) -> guest BLACK-HOLED" "pve-vmnic-fix $id" 1; broken=1
+          register_fix vmnic_plumbing "pve-vmnic-fix $id (repair guest $id NIC plumbing)" fix_vmnic_plumbing "$id"
+        fi
+      else
+        record WARN PLUMBING vmnic_plumbing "$ty $id net$idx: no $tap/$fwpr interface (guest just started?)" "qm config $id ; verify guest is running"
+      fi
+    done <<< "$(echo "$cfg" | grep -E '^net[0-9]+')"
+  done
+  [ "$broken" = 0 ] && record OK PLUMBING vmnic_plumbing "$guests guests / $checked NICs: plumbing intact (tap->fwbr->vnet)"
+}
+
+run_local() {
+  detect_ifaces
+  discover_local
+  data NODE "$(hostname)"; data KERNEL "$(uname -r)"
+  if [ "$ONLY" != overlay ]; then
+    chk_ip_forward; chk_frr_daemon; chk_iface_link; chk_iface_errors; chk_iface_flap
+    chk_optics_dom; chk_bond_lacp; chk_mtu; chk_ceph_net
+    if [ "${IS_SDN:-0}" = 1 ]; then chk_bgp_evpn; chk_bgp_external; chk_vtep_reach; fi
+  fi
+  if [ "$ONLY" != underlay ]; then
+    if [ "${IS_SDN:-0}" = 1 ]; then
+      chk_evpn_vnis; chk_evpn_routes; chk_irb_gw; chk_l3vni_fdb; chk_rib_fib; chk_vrf_reach
+    else
+      record OK OVERLAY overlay "no VXLAN/EVPN overlay on this node - overlay checks N/A"
+    fi
+    chk_vmnic_plumbing
+  fi
+  run_fixes
+  exit "$WORST"
+}
+
+# =============================================================================
+#  CONTROLLER  (iterate nodes over SSH, aggregate, render)
+# =============================================================================
+declare -A NODE_WORST SUM_UL SUM_OL SUM_PL NODE_ROLE
+declare -a REC FIXREC
+GLOBAL=0; UNREACH=0; N_OK=0; N_WARN=0; N_FAIL=0
+US=$'\037'   # unit-separator: in-array field delimiter (cannot appear in output)
+
+sev_word()  { case "$1" in 0|OK) echo OK;; 1) echo WARN;; 2) echo FAIL;; UNREACH) echo UNREACH;; *) echo OK;; esac; }
+sev_color() { case "$1" in OK) printf '%s' "$GRN";; WARN) printf '%s' "$YLW";; FAIL|UNREACH) printf '%s' "$RED";; *) printf '%s' "$BLU";; esac; }
+cell()      { local w; w=$(sev_word "$1"); printf "%s[%-5s]%s" "$(sev_color "$w")" "$w" "$NC"; }
+json_escape(){ local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/ }; s=${s//$'\n'/ }; printf '%s' "$s"; }
+
+run_node() { # collect records into REC[]; never render inline
+  local node="$1" out rc
+  local envp="SDN_FW_MASTER='$SDN_FW_MASTER' SDN_FW_BACKUP='$SDN_FW_BACKUP' SDN_VRF_PROBES='$SDN_VRF_PROBES' SDN_MTU_DELTA='$SDN_MTU_DELTA'"
+  local rargs="--local"
+  [ -n "$ONLY" ] && rargs="$rargs --only $ONLY"
+  [ -n "$ONLY_CHECKS" ] && rargs="$rargs --check ${ONLY_CHECKS// /,}"
+  [ "$FIX_MODE" = 1 ] && rargs="$rargs --fix ${FIX_CHECKS// /,}"
+  [ "$FIX_MODE" = 2 ] && rargs="$rargs --fix ${FIX_CHECKS// /,} --apply --yes"
+  [ "$JSON" = 0 ] && [ -t 2 ] && printf '%s  scanning %s ...%s\r' "$BLU" "$node" "$NC" >&2
+  out=$(ssh $SSH_BASE_OPTS $SDN_SSH_OPTS "$node" "$envp bash -s -- $rargs" < "$0" 2>/dev/null)
+  rc=$?
+  local short; short=$(echo "$node" | sed 's/^[^@]*@//')
+  if [ $rc -ge 250 ] || { [ $rc -ne 0 ] && [ -z "$out" ]; }; then
+    UNREACH=1; NODE_WORST[$short]=UNREACH; N_FAIL=$((N_FAIL+1))
+    REC+=("$short${US}FAIL${US}NODE${US}ssh${US}UNREACHABLE (ssh rc=$rc)${US}Check SSH/keys/ProxyJump and that the node is up${US}0")
+    return
+  fi
+  local nm; nm=$(echo "$out" | awk -F'\037' '$1=="__DATA__" && $2=="NODE"{print $3;exit}'); [ -n "$nm" ] && short="$nm"
+  local role; role=$(echo "$out" | awk -F'\037' '$1=="__DATA__" && $2=="IS_SDN"{print ($3==1?"sdn":"non-sdn");exit}'); NODE_ROLE[$short]=${role:-?}
+  local nworst=0 tag sev layer chk msg hint fix
+  while IFS=$'\037' read -r tag sev layer chk msg hint fix; do
+    case "$tag" in
+      __REC__)
+        REC+=("$short${US}$sev${US}$layer${US}$chk${US}$msg${US}$hint${US}${fix:-0}")
+        local r; r=$(sev_rank "$sev"); [ "$r" -gt "$nworst" ] && nworst=$r; [ "$r" -gt "$GLOBAL" ] && GLOBAL=$r
+        case "$sev" in OK) N_OK=$((N_OK+1));; WARN) N_WARN=$((N_WARN+1));; FAIL) N_FAIL=$((N_FAIL+1));; esac
+        case "$layer" in
+          UNDERLAY) [ "$r" -gt "${SUM_UL[$short]:-0}" ] && SUM_UL[$short]=$r;;
+          OVERLAY)  [ "$r" -gt "${SUM_OL[$short]:-0}" ] && SUM_OL[$short]=$r;;
+          PLUMBING) [ "$r" -gt "${SUM_PL[$short]:-0}" ] && SUM_PL[$short]=$r;;
+        esac
+        ;;
+      __FIX__) [ "$sev" = NONE ] || FIXREC+=("$short${US}$sev${US}$layer${US}$chk");;  # node|status|check|desc
+    esac
+  done <<< "$out"
+  NODE_WORST[$short]=$nworst
+}
+
+print_records() { # <severity> : render all buffered records of that severity
+  local want="$1" e node sev layer chk msg hint fix badge
+  for e in "${REC[@]}"; do
+    IFS="$US" read -r node sev layer chk msg hint fix <<< "$e"
+    [ "$sev" = "$want" ] || continue
+    [ "$want" = OK ] && [ "$SHOW_OK" = 0 ] && continue
+    badge=""; [ "${fix:-0}" = 1 ] && badge=" ${GRN}(fixable)${NC}"
+    printf "%-16s %s[%-4s]%s %-9s %-13s %s%b\n" "$node" "$(sev_color "$sev")" "$sev" "$NC" "$layer" "$chk" "$msg" "$badge"
+    [ "$sev" != OK ] && [ -n "$hint" ] && printf "        %s=> FIX:%s %s\n" "$YLW" "$NC" "$hint"
+  done
+}
+
+top_suspects() {
+  local e node sev layer chk out="" tip
+  for e in "${REC[@]}"; do
+    IFS="$US" read -r node sev layer chk _ <<< "$e"; [ "$sev" = FAIL ] || continue
+    case "$chk" in
+      ip_forward)     tip="north/south transit black-hole";;
+      bgp_evpn)       tip="overlay control-plane down";;
+      l3vni_fdb)      tip="symmetric-IRB black-hole likely";;
+      vmnic_plumbing) tip="a guest is isolated on this node";;
+      bgp_external)   tip="tenant north/south peering down";;
+      *) continue;;
+    esac
+    out="$out  $(printf '%-16s %-14s' "$node" "$chk")-> $tip"$'\n'
+  done
+  [ -n "$out" ] && { printf "%sTOP SUSPECTS (blast radius)%s\n%s" "$BLD" "$NC" "$out"; }
+}
+
+remediation() {
+  [ "${#FIXREC[@]}" -eq 0 ] && return
+  local e node st chk desc c
+  printf "%sREMEDIATION%s (%s):\n" "$BLD" "$NC" "$([ "$FIX_MODE" = 2 ] && echo applied || echo preview)"
+  for e in "${FIXREC[@]}"; do
+    IFS="$US" read -r node st chk desc <<< "$e"
+    case "$st" in APPLIED) c="$GRN";; FAILED|DENIED) c="$RED";; PREVIEW) c="$YLW";; *) c="$BLU";; esac
+    printf "  %-16s %s[%-8s]%s %-13s %s\n" "$node" "$c" "$st" "$NC" "$chk" "$desc"
+  done
+  [ "$FIX_MODE" = 1 ] && printf "  %s-> re-run as root with --apply to execute these (audit log: %s)%s\n" "$BLU" "$FIX_LOG" "$NC"
+}
+
+emit_json() {
+  local objs="" e node sev layer chk msg hint fix
+  for e in "${REC[@]}"; do
+    IFS="$US" read -r node sev layer chk msg hint fix <<< "$e"
+    if have jq; then
+      objs="$objs,$(jq -nc --arg n "$node" --arg s "$sev" --arg l "$layer" --arg c "$chk" --arg m "$msg" --arg h "$hint" --argjson f "${fix:-0}" \
+        '{node:$n,id:($l+"."+$c),layer:$l,check:$c,severity:$s,message:$m,hint:$h,auto_fixable:($f==1)}')"
+    else
+      objs="$objs,{\"node\":\"$(json_escape "$node")\",\"id\":\"$layer.$chk\",\"layer\":\"$layer\",\"check\":\"$chk\",\"severity\":\"$sev\",\"message\":\"$(json_escape "$msg")\",\"hint\":\"$(json_escape "$hint")\",\"auto_fixable\":$([ "${fix:-0}" = 1 ] && echo true || echo false)}"
+    fi
+  done
+  objs="[${objs#,}]"
+  local rid res; rid="$(date -Is 2>/dev/null)/$(hostname 2>/dev/null)"
+  case "${EXITC:-$GLOBAL}" in 0) res=OK;; 1) res=WARN;; 2) res=FAIL;; 3) res=UNKNOWN;; esac
+  if have jq; then
+    jq -n --arg sv "1.0" --arg rid "$rid" --arg res "$res" --argjson ec "${EXITC:-$GLOBAL}" \
+          --argjson f "$N_FAIL" --argjson w "$N_WARN" --argjson o "$N_OK" --argjson ck "$objs" \
+      '{schema_version:$sv,run_id:$rid,tool:"pve-sdn-healthcheck",result:$res,exit_code:$ec,counts:{fail:$f,warn:$w,ok:$o},checks:$ck}'
+  else
+    printf '{"schema_version":"1.0","run_id":"%s","tool":"pve-sdn-healthcheck","result":"%s","exit_code":%d,"counts":{"fail":%d,"warn":%d,"ok":%d},"checks":%s}\n' \
+      "$rid" "$res" "${EXITC:-$GLOBAL}" "$N_FAIL" "$N_WARN" "$N_OK" "$objs"
+  fi
+}
+
+main_controller() {
+  local n; for n in $SDN_NODES; do run_node "$n"; done
+  [ "$JSON" = 0 ] && [ -t 2 ] && printf '%-70s\r' "" >&2
+  # An unreachable node means we cannot confirm cluster health -> UNKNOWN (3),
+  # unless a reachable node already produced a hard FAIL (2 is more actionable).
+  local EXITC=$GLOBAL
+  [ "$UNREACH" = 1 ] && [ "$EXITC" -lt 2 ] && EXITC=3
+  if [ "$JSON" = 1 ]; then emit_json; exit "$EXITC"; fi
+  local verdict vc
+  case "$EXITC" in 0) verdict=OK;; 1) verdict=WARN;; 2) verdict=FAIL;; 3) verdict=UNKNOWN;; esac
+  vc=$(sev_color "$verdict")
+  if [ "$QUIET" = 0 ]; then
+    printf "%s== PVE SDN Health Check ==%s  v%s  %s  controller=%s\n" "$BLD" "$NC" "$VERSION" "$(date -Is 2>/dev/null)" "$(hostname 2>/dev/null)"
+    printf "nodes: %s\n" "$SDN_NODES"
+  fi
+  printf "%sVERDICT: %s[ %s ]%s   %s%d FAIL%s / %s%d WARN%s / %s%d OK%s\n" "$BLD" "$vc" "$verdict" "$NC" "$RED" "$N_FAIL" "$NC" "$YLW" "$N_WARN" "$NC" "$GRN" "$N_OK" "$NC"
+  printf '%s\n' "------------------------------------------------------------------------"
+  print_records FAIL; print_records WARN; print_records OK
+  [ "$QUIET" = 0 ] && [ "$SHOW_OK" = 0 ] && [ "$N_OK" -gt 0 ] && printf "%s(%d OK checks hidden -- use --all to show)%s\n" "$BLU" "$N_OK" "$NC"
+  printf '%s\n' "------------------------------------------------------------------------"
+  printf "%sSUMMARY%s  %-16s  %-8s  %-8s  %-8s  %s\n" "$BLD" "$NC" "NODE" "UNDERLAY" "OVERLAY" "PLUMBING" "ROLE"
+  local short
+  for short in $(printf '%s\n' "${!NODE_WORST[@]}" | sort); do
+    if [ "${NODE_WORST[$short]}" = UNREACH ]; then printf "         %-16s  %s\n" "$short" "$(cell UNREACH)"
+    else printf "         %-16s  %s  %s  %s  %s\n" "$short" "$(cell "${SUM_UL[$short]:-0}")" "$(cell "${SUM_OL[$short]:-0}")" "$(cell "${SUM_PL[$short]:-0}")" "${NODE_ROLE[$short]:-?}"; fi
+  done
+  printf '%s\n' "------------------------------------------------------------------------"
+  top_suspects
+  remediation
+  printf "%sCLUSTER NETWORK: %s[ %s ]%s  (exit %d)\n" "$BLD" "$vc" "$verdict" "$NC" "$EXITC"
+  exit "$EXITC"
+}
+
+# ----------------------------- dispatch --------------------------------------
+# Auto-discover the cluster node list when not given (--node / SDN_NODES).
+discover_nodes() {
+  [ -n "$SDN_NODES" ] && return
+  if [ -r /etc/pve/.members ]; then
+    SDN_NODES=$(grep -oE '"ip": *"[0-9.]+"' /etc/pve/.members 2>/dev/null | grep -oE '[0-9.]+' | tr '\n' ' ')
+  fi
+  if [ -z "$SDN_NODES" ] && have pvecm; then
+    SDN_NODES=$(pvecm status 2>/dev/null | awk '/^0x0000/{print $3}' | grep -oE '[0-9.]+' | tr '\n' ' ')
+  fi
+  [ -z "$SDN_NODES" ] && { echo "No nodes to check: pass --node a,b,c or set SDN_NODES (this host has no pvecm/.members)." >&2; exit 3; }
+}
+
+[ -n "$EXPLAIN" ] && { explain "$EXPLAIN"; exit 0; }
+if [ "$MODE" = local ]; then run_local; else
+  command -v ssh >/dev/null 2>&1 || { echo "ssh required on controller" >&2; exit 3; }
+  discover_nodes
+  if [ "$FIX_MODE" = 2 ] && [ "$FIX_YES" = 0 ]; then
+    if [ -t 0 ]; then
+      printf "About to APPLY auto-fixes (%s) on: %s\nProceed? [y/N] " "$FIX_CHECKS" "$SDN_NODES" >&2
+      read -r ans; case "$ans" in y|Y|yes|YES) ;; *) echo "aborted -> downgrading to preview" >&2; FIX_MODE=1;; esac
+    else
+      echo "refusing --apply without --yes in a non-interactive context -> preview only" >&2; FIX_MODE=1
+    fi
+  fi
+  main_controller
+fi
