@@ -1,0 +1,24 @@
+Source: pve-tools
+Section: admin
+Priority: optional
+Maintainer: Ciro Iriarte <ciro.iriarte+software@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/ciroiriarte/pve-tools
+Rules-Requires-Root: no
+
+Package: pve-tools
+Architecture: all
+Depends: ${misc:Depends}, bash (>= 4)
+Recommends: libguestfs-tools, qemu-utils
+Description: Operational scripts for Proxmox VE clusters
+ A bundle of administrative command-line tools for Proxmox VE nodes:
+ .
+  * pve-import-cloud-images — import upstream cloud images as PVE templates,
+    dynamically discovering the latest releases from distribution mirrors.
+  * pve-vmnic-fix — repair VM/CT network bridges after host network changes
+    (pending-config apply, networking restart, or SDN reload).
+  * pve-create-tshoot-image — build a ReaR troubleshooting / restore ISO.
+  * pve-sdn-healthcheck — validate the SDN network layer (underlay + overlay).
+ .
+ Each tool ships with an 8-section man page and shared bash completion.

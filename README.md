@@ -368,6 +368,41 @@ or unreachable node).
 
 ## Installation
 
+Two methods are supported. The **`.deb` package** is recommended on a real PVE
+node (clean upgrades and removal via `apt`); the **manual copy** is handy for a
+quick try-out or air-gapped hosts.
+
+### Method 1 — Debian package (recommended)
+
+Pre-built `.deb` packages are published from the [openSUSE Build
+Service](https://build.opensuse.org) and built directly from this repository's
+tagged releases. PVE 8 runs on Debian 12 (Bookworm), PVE 9 on Debian 13
+(Trixie) — pick the matching line below.
+
+```bash
+# --- PVE 8 / Debian 12 (Bookworm) --------------------------------------------
+REPO=https://download.opensuse.org/repositories/home:/ciriarte:/pve-tools/Debian_12
+
+# --- PVE 9 / Debian 13 (Trixie) ----------------------------------------------
+# REPO=https://download.opensuse.org/repositories/home:/ciriarte:/pve-tools/Debian_13
+
+# Trust the repository signing key and register the repo
+curl -fsSL "$REPO/Release.key" | gpg --dearmor -o /usr/share/keyrings/pve-tools.gpg
+echo "deb [signed-by=/usr/share/keyrings/pve-tools.gpg] $REPO/ /" \
+  > /etc/apt/sources.list.d/pve-tools.list
+
+apt update && apt install pve-tools
+```
+
+This installs the four scripts to `/usr/sbin`, their man pages to
+`/usr/share/man/man8`, and the bash completion to
+`/usr/share/bash-completion/completions`. Updates then arrive with the usual
+`apt upgrade`. To install a single `.deb` without adding the repo, download it
+from the `Debian_12/all/` (or `Debian_13/all/`) directory and run
+`apt install ./pve-tools_*.deb`.
+
+### Method 2 — Manual copy
+
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
@@ -384,6 +419,18 @@ Bash completions are provided in `completions/`. To install them:
 
 ```bash
 cp completions/pve-tools.bash /etc/bash_completion.d/pve-tools
+```
+
+### Building the package
+
+Debian packaging lives in [`packaging/debian/`](packaging/debian/). The OBS
+project sources this repository over plain git, tracks new release tags, and
+rebuilds the `.deb` automatically — no tarball is committed. To build locally
+instead, expose the packaging as a top-level `debian/` and build:
+
+```bash
+ln -s packaging/debian debian
+dpkg-buildpackage -us -uc -b
 ```
 
 ## License

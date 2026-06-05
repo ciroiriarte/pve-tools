@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# pve-tools is a bundle of standalone bash scripts — nothing to compile.
+# Install the scripts, man pages and bash completion directly.
+
+SCRIPTS = pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck
+PKGDIR  = debian/pve-tools
+
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d $(PKGDIR)/usr/sbin
+	install -m 0755 $(SCRIPTS) $(PKGDIR)/usr/sbin
+	install -d $(PKGDIR)/usr/share/man/man8
+	install -m 0644 man/man8/*.8 $(PKGDIR)/usr/share/man/man8
+	install -d $(PKGDIR)/usr/share/bash-completion/completions
+	install -m 0644 completions/pve-tools.bash \
+		$(PKGDIR)/usr/share/bash-completion/completions/pve-tools
