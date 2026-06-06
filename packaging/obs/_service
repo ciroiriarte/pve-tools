@@ -1,12 +1,15 @@
 <services>
   <!-- Pull the bundle straight from the public GitHub repo. Runs server-side
-       and is re-executed periodically, so new release tags are picked up and
-       rebuilt automatically. The debian/* packaging is sourced from
-       packaging/debian/ in the same checkout (no duplication here). -->
+       and is re-executed periodically. revision=@PARENT_TAG@ checks out the
+       latest v* tag (the released code) rather than branch HEAD, so untagged
+       commits to master are NOT built and a new release tag is picked up and
+       built automatically. The debian/* packaging is sourced from
+       packaging/debian/ in that same checkout (no duplication here). -->
   <service name="tar_scm">
     <param name="scm">git</param>
     <param name="url">https://github.com/ciroiriarte/pve-tools.git</param>
     <param name="filename">pve-tools</param>
+    <param name="revision">@PARENT_TAG@</param>
     <param name="versionformat">@PARENT_TAG@</param>
     <param name="versionrewrite-pattern">v(.*)</param>
     <param name="versionrewrite-replacement">\1</param>
