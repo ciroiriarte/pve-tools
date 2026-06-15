@@ -14,9 +14,11 @@
 #    by an on-call operator at 3 a.m. without prior context.
 #
 #  SAFETY
-#    *** STRICTLY READ-ONLY ***  This script only ever runs "show"/"get"/read
-#    commands (vtysh -c 'show ...', ip/bridge show, ethtool, sysctl -n, ping).
-#    It never mutates configuration, restarts services, or writes files.
+#    *** READ-ONLY BY DEFAULT ***  With no --fix/--apply the script only ever
+#    runs "show"/"get"/read commands (vtysh -c 'show ...', ip/bridge show,
+#    ethtool, sysctl -n, ping): it never mutates config, restarts services, or
+#    writes files.  Remediation is strictly OPT-IN (--fix previews, --apply
+#    executes, root + logged) and limited to the allow-list (see SAFE AUTO-FIX).
 #
 #  KNOWN FAILURE MODES THIS SCRIPT DETECTS (from real incidents)
 #    1. net.ipv4.ip_forward=0 (or conf.all/default.forwarding) -> overlay<->
@@ -25,9 +27,17 @@
 #       black-hole.  Distinguishes a REAL black-hole from BENIGN on-demand
 #       absence (a node hosting 0 guests in that L3 domain legitimately has no
 #       FDB entry) using control-plane evidence + a data-plane probe.
-#    3. Stale/phantom zebra route advertised into BGP but absent from kernel
+#    3. Stale zebra<->bgpd ZAPI (zserv.api) socket: bgpd holds the EVPN type-2
+#       RMAC routes but zebra never installs them (empty 'show evpn rmac vni'),
+#       so the L3-VNI FDB stays empty -> black-hole.  The defining trait is that
+#       it SURVIVES 'systemctl restart frr' AND 'pkill -9 zebra' -- only clearing
+#       the stale /var/run/frr/*.api socket recovers it.  Detected (read-only) by
+#       correlating empty zebra RMAC + non-empty bgpd EVPN RIB + the FRR-log
+#       signature (zclient_send_message() failed / buffer_flush_available ...
+#       Broken pipe / "zebra state -> down").  Opt-in fix: --fix zapi_socket.
+#    4. Stale/phantom zebra route advertised into BGP but absent from kernel
 #       FIB (RIB/FIB mismatch).
-#    4. BGP/EVPN session not Established (node peers = FAIL; backup firewall
+#    5. BGP/EVPN session not Established (node peers = FAIL; backup firewall
 #       with FRR down = WARN, since that is an expected degraded state).
 #    + MTU mismatch (underlay must exceed overlay by >= 50B), NIC errors/drops,
 #      optic/DOM alarms, interface flapping, bond/LACP health, ECMP presence.
@@ -49,16 +59,22 @@
 #      --quiet             reserved for monitoring wrappers (suppress decoration)
 #      --no-color          disable ANSI colour (also auto-off when not a TTY)
 #      --list-checks       print the check catalogue and exit
-#      --fix [CHECKS]      PREVIEW safe auto-remediations (default: all allow-listed)
+#      --fix [CHECKS]      PREVIEW safe auto-remediations (default: all allow-listed).
+#                          Opt-in-only fixes (e.g. zapi_socket) run ONLY when named
+#                          explicitly, e.g. --fix zapi_socket -- never by default.
 #      --apply             execute the previewed fixes (root; implies --fix)
 #      -y, --yes           skip the apply confirmation (required non-interactively)
 #      --local             INTERNAL: run on the current host & emit machine records
 #      -h, --help          this help        -v, --version   print version
 #
 #  SAFE AUTO-FIX (opt-in) -- allow-listed, idempotent, logged to
-#    /var/log/pve-sdn-healthcheck-fix.log.  ONLY: ip_forward (set+persist),
-#    vmnic_plumbing (delegates to pve-vmnic-fix), frr_daemon (enable at boot).
-#    BGP/EVPN, zebra/FRR restart, MTU, optics, bonds are NEVER auto-fixed.
+#    /var/log/pve-sdn-healthcheck-fix.log.  DEFAULT allow-list: ip_forward
+#    (set+persist), vmnic_plumbing (delegates to pve-vmnic-fix), frr_daemon
+#    (enable at boot, NO restart).  BGP/EVPN, MTU, optics, bonds are NEVER
+#    auto-fixed.  ONE opt-in-only exception that DOES restart FRR --
+#    zapi_socket (clears a stale /var/run/frr/*.api socket then restarts FRR to
+#    recover failure mode #3) -- is kept OUT of the default set and runs only
+#    when named explicitly: --fix zapi_socket --apply.
 #
 #  CONFIG  (override via env or /etc/pve-sdn-healthcheck.conf -- a sourced file).
 #    Everything auto-discovers; these are OPTIONAL overrides:
@@ -97,12 +113,16 @@ FIX_LOG="/var/log/pve-sdn-healthcheck-fix.log"
 # Checks with a SAFE, bounded, idempotent auto-remediation (everything else is
 # advisory only and must be fixed by a human).
 FIX_ALLOWLIST="ip_forward vmnic_plumbing frr_daemon"
+# OPT-IN-ONLY remediations: never auto-selected by a bare --fix; eligible solely
+# when the operator names them explicitly (e.g. --fix zapi_socket).  These carry
+# more blast radius (zapi_socket restarts FRR) so they must be a deliberate act.
+FIX_OPTIN="zapi_socket"
 
 # ----------------------------- option parsing --------------------------------
 MODE=controller; ONLY=""; ONLY_CHECKS=""; JSON=0; QUIET=0; NOCOLOR=0; SHOW_OK=0
 FIX_MODE=0; FIX_YES=0; FIX_CHECKS=""; EXPLAIN=""
 SEL_NODES=""
-usage() { sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'; }
 list_checks() {
   cat <<'L'
 UNDERLAY  ip_forward        IPv4 forwarding runtime + persistence
@@ -124,6 +144,8 @@ OVERLAY   l3vni_fdb         L3-VNI FDB VTEPs (black-hole vs benign on-demand)
 OVERLAY   rib_fib           RIB/FIB consistency (no phantom advertised routes)
 OVERLAY   vrf_reach         Per-VRF external/data-plane reachability probe
 PLUMBING  vmnic_plumbing    Guest NIC bridge plumbing intact (mirrors pve-vmnic-fix)
+FIX-ONLY  zapi_socket       opt-in remediation for l3vni_fdb failure mode #3 (stale
+                            zebra ZAPI socket); runs only via --fix zapi_socket --apply
 L
 }
 while [ $# -gt 0 ]; do
@@ -184,7 +206,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # (BGP, zebra/FRR restart, MTU, optics, bonds...) is advisory-only by design.
 declare -a FIX_QUEUE
 register_fix() { # <check> <human-description> <fn> [arg]
-  case " $FIX_ALLOWLIST " in *" $1 "*) ;; *) return;; esac
+  # Eligible if EITHER in the default allow-list OR an opt-in-only fix.  Opt-in
+  # fixes still pass the FIX_CHECKS gate below, so a bare --fix (which seeds
+  # FIX_CHECKS from the allow-list only) can never select them -- they require
+  # being named explicitly on --fix.
+  case " $FIX_ALLOWLIST " in *" $1 "*) ;; *)
+    case " $FIX_OPTIN " in *" $1 "*) ;; *) return;; esac ;;
+  esac
   [ "$FIX_MODE" -ge 1 ] || return
   case " $FIX_CHECKS " in *" $1 "*) ;; *) return;; esac
   FIX_QUEUE+=("$1|$2|$3|${4:-}")
@@ -198,6 +226,22 @@ fix_ip_forward() {
 }
 fix_frr_daemon() { systemctl enable frr >/dev/null 2>&1; }   # boot persistence only, NO restart
 fix_vmnic_plumbing() { have pve-vmnic-fix && pve-vmnic-fix "$1" >/dev/null 2>&1; }
+# OPT-IN-ONLY (never in FIX_ALLOWLIST).  Recover a wedged zebra<->bgpd ZAPI:
+# /var/run/frr/zserv.api (the .api/.sock control-plane socket) goes stale and a
+# plain 'systemctl restart frr' -- and even 'pkill -9 zebra' -- does NOT clear
+# it, so zebra keeps failing to import the EVPN RMAC FDB (failure mode #3).  The
+# durable remedy is: stop FRR, reap any straggler daemons still holding the old
+# socket, delete the stale socket files, then start FRR so it recreates them and
+# re-installs the router-MAC->VTEP FDB.  Idempotent; restarts FRR (hence opt-in).
+fix_zapi_socket() {
+  systemctl stop frr >/dev/null 2>&1
+  pkill -9 -x zebra  >/dev/null 2>&1
+  pkill -9 -x bgpd   >/dev/null 2>&1
+  rm -f /var/run/frr/*.api /var/run/frr/*.sock 2>/dev/null
+  systemctl start frr >/dev/null 2>&1
+  sleep 3
+  systemctl is-active frr >/dev/null 2>&1
+}
 run_fixes() {
   [ "$FIX_MODE" -ge 1 ] || return
   if [ "${#FIX_QUEUE[@]}" -eq 0 ]; then printf '__FIX__\037NONE\037-\037no auto-fixable issues on this node\n'; return; fi
@@ -232,6 +276,26 @@ l3vni_fdb  (OVERLAY)
   OK    entries present, OR node is idle in the VRF (benign on-demand absence).
   WARN  empty + local demand but no probe target to confirm (set SDN_VRF_PROBES).
   FAIL  empty + demand + data-plane probe fails  -> real black-hole.
+  ROOT  When the FDB is empty yet bgpd HOLDS the EVPN RMAC routes and the FRR
+        log shows the ZAPI signature, the cause is a stale zebra control-plane
+        socket (failure mode #3): the check asserts FAIL even without a probe
+        and offers the opt-in fix.  See --explain zapi_socket.
+X
+;;
+    zapi_socket) cat <<'X'
+zapi_socket  (OVERLAY remediation -- OPT-IN auto-fix only, NOT a check)
+  WHAT  Recovers a stale zebra<->bgpd ZAPI (/var/run/frr/zserv.api) socket: bgpd
+        holds the EVPN type-2 RMAC routes but zebra never installs them, so the
+        L3-VNI FDB stays empty and routed overlay traffic black-holes.
+  TELL  'show evpn rmac vni <vni>' empty WHILE 'show bgp l2vpn evpn summary' has
+        RIB entries, plus the FRR log: zclient_send_message() failed /
+        buffer_flush_available ... Broken pipe / "zebra state -> down".
+  WHY   The stale socket SURVIVES 'systemctl restart frr' and 'pkill -9 zebra';
+        only deleting the socket file and restarting clears it.
+  FIX   systemctl stop frr && rm -f /var/run/frr/*.api /var/run/frr/*.sock \
+          && systemctl start frr
+        Opt-in only (restarts FRR): --fix zapi_socket --apply (NOT in the
+        default allow-list; must be named explicitly).
 X
 ;;
     vmnic_plumbing) cat <<'X'
@@ -591,12 +655,43 @@ chk_irb_gw() {
     || record OK OVERLAY irb_gw "IRB/VRF devices up"
 }
 
+# READ-ONLY root-cause probe for KNOWN FAILURE MODE #3: a stale zebra<->bgpd
+# ZAPI (zserv.api) socket.  Returns 0 (stalled) when ALL hold for the VNI:
+#   (a) zebra's installed RMAC table is empty   ('show evpn rmac vni <vni>'),
+#   (b) bgpd DID learn EVPN routes to install   (RIB entries > 0), and
+#   (c) the FRR log carries the ZAPI-failure signature.
+# (a)+(b) = "control plane has it, data plane never got it"; (c) is the smoking
+# gun that pins it on the socket rather than a transient.  All three are needed
+# so we never mislabel a benign/transient absence as the socket bug.  Requires
+# journalctl; without it we cannot confirm (c) and return non-zero (stay generic).
+zapi_stalled() { # <vni>
+  local vni="$1"
+  [ -n "$vni" ] || return 1
+  have vtysh || return 1
+  # (a) zebra side: count installed remote router-MACs (MAC-address rows only)
+  local rmac; rmac=$(vtysh -c "show evpn rmac vni $vni" 2>/dev/null \
+    | grep -ciE '([0-9a-f]{2}:){5}[0-9a-f]{2}')
+  [ "${rmac:-0}" -eq 0 ] || return 1           # zebra HAS RMACs -> not this bug
+  # (b) bgpd side: the EVPN control plane actually has routes to install
+  local rib; rib=$(vtysh -c 'show bgp l2vpn evpn summary' 2>/dev/null \
+    | grep -oE 'RIB entries [0-9]+' | grep -oE '[0-9]+' | head -1)
+  { [ -n "$rib" ] && [ "$rib" -gt 0 ] 2>/dev/null; } || return 1   # nothing to install
+  # (c) smoking gun: the zserv.api IPC failure signature in the FRR log
+  have journalctl || return 1
+  journalctl -u frr --since '-2 hours' --no-pager 2>/dev/null \
+    | grep -qiE 'zclient_send_message\(\) failed|buffer_flush_available.*broken pipe|zebra state -> down|initial connection attempt failed'
+}
+
 # The crown jewel: distinguish a real L3-VNI black-hole from benign on-demand
-# absence (see KNOWN FAILURE MODE #2).
+# absence (see KNOWN FAILURE MODE #2), and pin a confirmed black-hole on the
+# stale-ZAPI-socket root cause (#3) when the evidence is present.
 chk_l3vni_fdb() {
   want_check l3vni_fdb || return
+  # Shared text for the #3 root cause so the message + fix stay in lockstep.
+  local zapi_fix="Clear the stale ZAPI socket: systemctl stop frr && rm -f /var/run/frr/*.api /var/run/frr/*.sock && systemctl start frr   (opt-in auto-fix: --fix zapi_socket --apply; a plain 'systemctl restart frr' does NOT clear it)"
+  local zapi_desc="clear stale zebra ZAPI socket then restart FRR (stop; rm /var/run/frr/*.api,*.sock; start) to re-import the EVPN RMAC FDB"
   for tuple in $SDN_L3VNIS; do
-    local vif="${tuple%%:*}" vrf; vrf="${tuple#*:}"; vrf="${vrf%:*}"
+    local vif="${tuple%%:*}" vrf vni="${tuple##*:}"; vrf="${tuple#*:}"; vrf="${vrf%:*}"
     ip link show "$vif" >/dev/null 2>&1 || { record OK OVERLAY l3vni_fdb "$vif not present - skipped"; continue; }
     local vteps; vteps=$(bridge fdb show dev "$vif" 2>/dev/null | grep -oE 'dst [0-9.]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
     # local demand for this VRF = live (resolved) neighbours in the VRF.  This
@@ -608,14 +703,20 @@ chk_l3vni_fdb() {
     elif [ "${nbrs:-0}" -eq 0 ]; then
       record OK OVERLAY l3vni_fdb "$vif no remote VTEP in FDB but node IDLE in $vrf (0 active neighbours) -> benign on-demand"
     else
-      # local demand exists & FDB empty -> probe to decide
+      # local demand exists & FDB empty -> probe + root-cause to decide
       local pip=""
       for pr in $SDN_VRF_PROBES; do [ "${pr%%:*}" = "$vrf" ] && pip="${pr#*:}"; done
       if [ -n "$pip" ] && ip vrf exec "$vrf" ping -c2 -W2 "$pip" >/dev/null 2>&1; then
-        record WARN OVERLAY l3vni_fdb "$vif FDB empty but data-plane to $pip OK (transient/on-demand learning)" "Monitor; if recurring, pkill -9 -x zebra (watchfrr respawns) to re-import EVPN FDB"
+        record WARN OVERLAY l3vni_fdb "$vif FDB empty but data-plane to $pip OK (transient/on-demand learning)" "Monitor; if recurring with an empty 'show evpn rmac vni $vni' it is a stale zebra ZAPI socket (mode #3) -> systemctl stop frr && rm -f /var/run/frr/*.api /var/run/frr/*.sock && systemctl start frr"
+      elif zapi_stalled "$vni"; then
+        # Confirmed #3: zebra RMAC empty + bgpd holds routes + FRR-log signature.
+        # This asserts FAIL even with no probe target, since the proof is in the
+        # control plane + logs, and registers the opt-in socket-clear fix.
+        record FAIL OVERLAY l3vni_fdb "$vif L3-VNI FDB empty + demand present, zebra RMAC empty WHILE bgpd holds EVPN routes + FRR log shows ZAPI failure -> stale zserv.api socket BLACK-HOLE (survives 'systemctl restart frr')" "$zapi_fix"
+        register_fix zapi_socket "$zapi_desc" fix_zapi_socket
       elif [ -n "$pip" ]; then
         record FAIL OVERLAY l3vni_fdb "$vif L3-VNI FDB empty + demand present + probe to $pip FAILS -> symmetric-IRB BLACK-HOLE" \
-          "Verify EVPN type-2/5 router-MAC; durable fix: restart zebra so it re-installs router-MAC->VTEP FDB"
+          "Verify EVPN type-2/5 router-MAC; if 'show evpn rmac vni $vni' is empty the durable fix is to clear the stale zebra ZAPI socket: systemctl stop frr && rm -f /var/run/frr/*.api /var/run/frr/*.sock && systemctl start frr (a plain 'systemctl restart frr' may NOT clear it)"
       else
         record WARN OVERLAY l3vni_fdb "$vif FDB empty + demand present, UNRESOLVED (no probe target to confirm black-hole)" "set SDN_VRF_PROBES=\"$vrf:<inside-ip>\" so this can be asserted PASS/FAIL instead of WARN"
       fi
