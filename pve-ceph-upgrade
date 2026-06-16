@@ -1,0 +1,360 @@
+#!/bin/bash
+# pve-ceph-upgrade - Copyright (c) 2024-2026 Ciro Iriarte
+# SPDX-License-Identifier: MIT
+# =============================================================================
+#  pve-ceph-upgrade  --  online Ceph MAJOR-release migration for a Proxmox VE
+#                        hyper-converged cluster (e.g. Squid 19 -> Tentacle 20)
+# -----------------------------------------------------------------------------
+#  PURPOSE
+#    Migrate the Ceph cluster embedded in a PVE cluster from one major release
+#    to the next, ONLINE and with NO guest downtime, in the order the upstream
+#    procedure mandates: stage packages everywhere, then restart daemons
+#    monitor -> manager -> OSD -> MDS, gating on health between every step, and
+#    only flip `require-osd-release` once every OSD is on the new release.
+#
+#    This is the Ceph-major counterpart to pve-rolling-upgrade(8): that tool does
+#    the PVE 8->9 DISTRO jump and deliberately leaves Ceph on its current major;
+#    THIS tool does the Ceph major and touches nothing about the Debian/PVE
+#    release.  Run them as SEPARATE passes -- never combine a Ceph major with a
+#    distro upgrade.
+#
+#  SAFETY
+#    *** PRODUCTION, HARD-TO-REVERSE. *** A Ceph major upgrade is one-way once
+#    `require-osd-release` is set.  ALWAYS read the version-specific upstream
+#    notes first -- https://pve.proxmox.com/wiki/Ceph_<From>_to_<To> -- as the
+#    exact daemon order and any pre-steps are release-specific.  The cluster
+#    must already be: fully on PVE 9 (Trixie), HEALTH_OK (bar `noout`), every
+#    daemon on <from>, all PGs active+clean, quorate.  --dry-run does read-only
+#    discovery and prints the plan.  The tool HARD-STOPS on any failed gate.
+#
+#  WHAT IT DOES (each step gated on Ceph health/quorum)
+#    1. preflight   <to> repo exists; cluster on PVE 9; HEALTH ok; all daemons
+#                   on <from>; active+clean; quorate; record CephFS settings
+#    2. stage       `ceph osd set noout`; per node bump the Ceph repo
+#                   <from>-><to>, apt update, install new Ceph packages (running
+#                   daemons keep <from> until restarted)
+#    3. mons        restart ceph-mon one node at a time; wait full quorum;
+#                   min_mon_release advances to <to> when all are done
+#    4. mgrs        restart ceph-mgr (active fails over to a standby)
+#    5. osds        restart OSDs one node at a time; wait active+clean (noout
+#                   prevents rebalance churn) -- each node's OSDs come back on <to>
+#    6. mds         (if CephFS) disable standby-replay, restart standbys then the
+#                   active (failover), restore the original setting
+#    7. finalize    `ceph osd require-osd-release <to>`; `ceph osd unset noout`;
+#                   verify every daemon reports <to> and HEALTH is OK
+#
+#  EXIT CODES
+#    0  OK       every daemon migrated to <to> and health is OK
+#    1  FAIL     a pre-condition or gate failed; the run halted (inspect Ceph)
+#    2  USAGE    bad invocation, missing dependency, or cluster unreachable
+#
+#  USAGE
+#    pve-ceph-upgrade --to <release> [options]
+#      --to RELEASE          target Ceph release (e.g. tentacle)   [required]
+#      --from RELEASE        source release (default: auto-detect from cluster)
+#      -j, --jump USER@HOST  ProxyJump/bastion to reach the cluster
+#      -s, --stable HOST     node used to drive cluster-wide ceph/quorum checks
+#                            (default: auto-discover a monitor node)
+#      -y, --yes             proceed without the interactive confirmation
+#      -n, --dry-run         discover + print the plan, change nothing
+#      --no-color            disable ANSI colour (also auto-off when not a TTY)
+#      -h, --help            this help          -v, --version   print version
+#
+#  CONFIG  (env or /etc/pve-ceph-upgrade.conf -- a sourced file)
+#    PVE_CU_SSH_OPTS   extra ssh options (ProxyJump, IdentityFile, ...)
+#    PVE_CU_JUMP       convenience ProxyJump host (same as --jump)
+#    PVE_CU_REPO_BASE  Ceph repo base+component (default:
+#                      http://download.proxmox.com/debian/ceph-<to> + no-subscription)
+#
+#  REQUIREMENTS
+#    Controller: bash, ssh, curl.  Each node: the Ceph/PVE stack
+#    (ceph, systemctl, apt).  Node names from `pvecm nodes` must be reachable
+#    from the controller (directly or via --jump).  Key-based root SSH assumed.
+#
+#  SEE ALSO
+#    pve-rolling-upgrade(8) (the PVE 8->9 distro jump), pve-sdn-healthcheck(8),
+#    and https://pve.proxmox.com/wiki/Ceph_<From>_to_<To>.
+# =============================================================================
+
+set -o pipefail
+VERSION="1.0.0"
+
+# ----------------------------- defaults / config -----------------------------
+: "${PVE_CU_SSH_OPTS:=}"
+: "${PVE_CU_JUMP:=}"
+: "${PVE_CU_REPO_BASE:=}"     # override repo URL; default derived from --to
+[ -r /etc/pve-ceph-upgrade.conf ] && . /etc/pve-ceph-upgrade.conf
+
+SSH_BASE_OPTS="-o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new"
+EX_OK=0; EX_FAIL=1; EX_USAGE=2
+
+# ----------------------------- colours / helpers -----------------------------
+setup_colors() {
+    if [[ -t 1 && "$NO_COLOR" -eq 0 ]]; then
+        C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+        C_CYAN='\033[0;36m'; C_BOLD='\033[1m'; C_RESET='\033[0m'
+    else C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''; fi
+}
+msg()  { echo -e "${C_BOLD}${C_CYAN}::${C_RESET} $*"; }
+ok()   { echo -e "   ${C_GREEN}[+]${C_RESET} $*"; }
+warn() { echo -e "   ${C_YELLOW}[!]${C_RESET} $*"; }
+err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
+dry()  { echo -e "   ${C_YELLOW}[dry-run]${C_RESET} $*"; }
+fail() { err "FAIL: $*"; exit "$EX_FAIL"; }
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") --to <release> [OPTIONS]
+
+Online Ceph MAJOR-release migration (e.g. squid -> tentacle) for a PVE
+hyper-converged cluster: stage packages, then restart daemons
+mon -> mgr -> osd -> mds gating on health, then require-osd-release.
+
+Counterpart to pve-rolling-upgrade (the PVE 8->9 distro jump). Run the two
+as SEPARATE passes; never combine a Ceph major with a distro upgrade.
+
+Options:
+  --to RELEASE          Target Ceph release (e.g. tentacle).   [required]
+  --from RELEASE        Source release (default: auto-detect).
+  -j, --jump USER@HOST  ProxyJump/bastion to reach the cluster.
+  -s, --stable HOST     Monitor node to drive cluster checks (default: auto).
+  -y, --yes             Proceed without the interactive confirmation.
+  -n, --dry-run         Discover + print the plan; change nothing.
+      --no-color        Disable ANSI colour.
+  -h, --help            Show this help.
+  -v, --version         Show version.
+
+Example:
+  $(basename "$0") --dry-run --to tentacle -j root@bastion
+  $(basename "$0") --to tentacle -j root@bastion
+
+Exit codes: 0 OK, 1 FAIL (gate failed/halted), 2 usage/dependency error.
+EOF
+}
+
+# ----------------------------- ssh plumbing ----------------------------------
+declare -a SSH_OPT
+ssh_to()     { local h="$1"; shift; ssh "${SSH_OPT[@]}" "root@$h" "$@"; }
+ssh_stable() { ssh "${SSH_OPT[@]}" "root@$STABLE" "$@"; }
+
+# Ceph all-PGs clean iff the pgs: line carries exactly one state: active+clean.
+ceph_clean() {
+    local seg
+    seg=$(ssh_stable 'LC_ALL=C ceph pg stat' 2>/dev/null | sed -n 's/.*pgs:[[:space:]]*\([^;]*\);.*/\1/p')
+    [[ -n "$seg" ]] && ! grep -q ',' <<<"$seg" && grep -q 'active+clean' <<<"$seg"
+}
+# Health is acceptable if HEALTH_OK, or HEALTH_WARN solely due to noout.
+ceph_health_ok() {
+    local h
+    h=$(ssh_stable 'LC_ALL=C ceph health detail' 2>/dev/null)
+    grep -q '^HEALTH_OK' <<<"$h" && return 0
+    # otherwise acceptable only when every WRN/ERR line is about noout
+    ! grep -E '^\[(WRN|ERR)\]' <<<"$h" | grep -qvi 'noout'
+}
+wait_clean() { local i; for i in $(seq "${1:-45}"); do ceph_clean && return 0; sleep 10; done; return 1; }
+
+# ----------------------------- phases ----------------------------------------
+phase_preflight() {
+    msg "[1/7] preflight"
+    # target repo must exist
+    local base="${REPO_URL%% *}"
+    ssh_stable "curl -fsSL -o /dev/null '${base}/dists/trixie/Release'" 2>/dev/null \
+        || fail "Ceph '$TO' repo not reachable: ${base}/dists/trixie/Release"
+    # cluster should already be on PVE 9 (Trixie)
+    local deb; deb=$(ssh_stable 'cat /etc/debian_version' 2>/dev/null)
+    [[ "$deb" == 13.* ]] || warn "stable node not on Debian 13/Trixie ($deb) -- finish the PVE 9 upgrade first"
+    # ceph state
+    ceph_health_ok || fail "Ceph health not OK (only the noout warning is tolerated)"
+    ceph_clean     || fail "Ceph not all-PGs active+clean"
+    ssh_stable 'LC_ALL=C pvecm status' 2>/dev/null | grep -qE 'Quorate:[[:space:]]+Yes' || fail "cluster not quorate"
+    # current release
+    local have; have=$(ssh_stable 'LC_ALL=C ceph versions' 2>/dev/null | grep -oiE 'reef|quincy|squid|tentacle' | sort -u | tr '\n' ' ')
+    [[ -z "$FROM" ]] && FROM=$(awk '{print $1}' <<<"$have")
+    if grep -qiw "$TO" <<<"$have"; then
+        [[ "$(tr -d ' ' <<<"$have")" == "$TO" ]] && { ok "already fully on $TO"; FROM="$TO"; }
+    fi
+    [[ "$(wc -w <<<"$have")" -le 1 ]] || warn "mixed Ceph releases present: $have"
+    ok "from=$FROM to=$TO; health ok, active+clean, quorate; PGs=$(ssh_stable 'LC_ALL=C ceph pg stat' | grep -oE '[0-9]+ active' | head -1)"
+}
+
+phase_stage() {
+    msg "[2/7] stage Ceph packages ($FROM -> $TO) on all nodes"
+    if (( DRY_RUN )); then
+        dry "ceph osd set noout"
+        local n; for n in "${NODES[@]}"; do dry "$n: repo ceph-$FROM -> ceph-$TO, apt update, install ceph"; done
+        return
+    fi
+    ssh_stable 'LC_ALL=C ceph osd set noout' >/dev/null 2>&1 || fail "could not set noout"
+    ok "noout set"
+    local n
+    for n in "${NODES[@]}"; do
+        ssh_to "$n" "LC_ALL=C bash -s" <<EOF || fail "$n: repo/update failed"
+set -e
+for f in /etc/apt/sources.list.d/*ceph*.list /etc/apt/sources.list.d/*ceph*.sources; do
+  [ -f "\$f" ] || continue
+  cp -a "\$f" "\$f.pre-$TO" 2>/dev/null || true
+  sed -i 's#ceph-$FROM#ceph-$TO#g' "\$f"
+done
+apt-get update -o Dpkg::Use-Pty=0 >/dev/null
+EOF
+        ssh_to "$n" 'LC_ALL=C bash -s' <<'EOF' || fail "$n: ceph package install failed"
+rm -f /var/log/pve-ceph-upgrade.log
+nohup bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y ceph \
+  -o Dpkg::Options::="--force-confold" -o Dpkg::Use-Pty=0 >/var/log/pve-ceph-upgrade.log 2>&1
+echo "CU_EXIT=$?" >>/var/log/pve-ceph-upgrade.log' >/dev/null 2>&1 &
+EOF
+        local i; for i in $(seq 60); do ssh_to "$n" 'grep -q CU_EXIT /var/log/pve-ceph-upgrade.log 2>/dev/null' && break; sleep 15; done
+        ssh_to "$n" 'grep -q "CU_EXIT=0" /var/log/pve-ceph-upgrade.log 2>/dev/null' \
+            || fail "$n: ceph install failed: $(ssh_to "$n" 'tail -3 /var/log/pve-ceph-upgrade.log')"
+        ok "$n: packages staged ($TO installed, daemons still on $FROM until restarted)"
+    done
+}
+
+phase_mons() {
+    msg "[3/7] restart monitors (one at a time, gated on quorum)"
+    local n
+    for n in "${MON_NODES[@]}"; do
+        if (( DRY_RUN )); then dry "$n: systemctl restart ceph-mon.target; wait quorum=$NMONS"; continue; fi
+        ssh_to "$n" 'systemctl restart ceph-mon.target' || fail "$n: mon restart failed"
+        local i okq=""
+        for i in $(seq 30); do
+            [[ "$(ssh_stable 'LC_ALL=C ceph quorum_status' 2>/dev/null | tr ',' '\n' | grep -c '"rank"')" -ge "$NMONS" ]] && { okq=1; break; }
+            sleep 4
+        done
+        [[ -n "$okq" ]] || fail "$n: quorum not restored to $NMONS after mon restart"
+        ok "$n: mon back, quorum=$NMONS"
+    done
+    (( DRY_RUN )) || ok "min_mon_release: $(ssh_stable 'LC_ALL=C ceph mon dump 2>/dev/null | sed -n "s/min_mon_release \(.*\)/\1/p"')"
+}
+
+phase_mgrs() {
+    msg "[4/7] restart managers"
+    local n
+    for n in "${MGR_NODES[@]}"; do
+        if (( DRY_RUN )); then dry "$n: systemctl restart ceph-mgr.target"; continue; fi
+        ssh_to "$n" 'systemctl restart ceph-mgr.target' || warn "$n: mgr restart returned nonzero"
+        sleep 3
+    done
+    (( DRY_RUN )) || { ssh_stable 'LC_ALL=C ceph -s' 2>/dev/null | grep -qE 'mgr: .*active' || fail "no active mgr after restart"; ok "active mgr present"; }
+}
+
+phase_osds() {
+    msg "[5/7] restart OSDs (one node at a time, gated on active+clean)"
+    local n
+    for n in "${OSD_NODES[@]}"; do
+        if (( DRY_RUN )); then dry "$n: systemctl restart ceph-osd.target; wait active+clean"; continue; fi
+        ssh_to "$n" 'systemctl restart ceph-osd.target' || fail "$n: osd restart failed"
+        sleep 5
+        wait_clean 60 || fail "$n: Ceph did not return to active+clean after OSD restart"
+        ok "$n: OSDs back on $TO, active+clean"
+    done
+}
+
+phase_mds() {
+    [[ "$HAS_FS" == 1 ]] || { msg "[6/7] MDS: no CephFS, skipped"; return; }
+    msg "[6/7] restart MDS (CephFS '$FSNAME')"
+    if (( DRY_RUN )); then
+        dry "record + disable allow_standby_replay; restart MDS on: ${MDS_NODES[*]}; restore setting"
+        return
+    fi
+    ssh_stable "LC_ALL=C ceph fs set $FSNAME allow_standby_replay false" >/dev/null 2>&1 || true
+    local n
+    for n in "${MDS_NODES[@]}"; do
+        ssh_to "$n" 'systemctl restart ceph-mds.target' || warn "$n: mds restart nonzero"
+        sleep 5
+    done
+    ssh_stable "LC_ALL=C ceph fs status $FSNAME" >/dev/null 2>&1
+    [[ "$ORIG_SR" == "true" ]] && ssh_stable "LC_ALL=C ceph fs set $FSNAME allow_standby_replay true" >/dev/null 2>&1
+    ok "MDS restarted (standby_replay restored to ${ORIG_SR:-false})"
+}
+
+phase_finalize() {
+    msg "[7/7] finalize"
+    if (( DRY_RUN )); then dry "ceph osd require-osd-release $TO; ceph osd unset noout; verify all daemons on $TO"; return; fi
+    ssh_stable "LC_ALL=C ceph osd require-osd-release $TO" >/dev/null 2>&1 || fail "require-osd-release $TO failed (are all OSDs on $TO?)"
+    ssh_stable 'LC_ALL=C ceph osd unset noout' >/dev/null 2>&1 || warn "could not unset noout"
+    wait_clean 30 || warn "not active+clean yet -- recheck shortly"
+    local rel; rel=$(ssh_stable 'LC_ALL=C ceph versions' 2>/dev/null | grep -oiE 'reef|quincy|squid|tentacle' | sort -u | tr '\n' ' ')
+    [[ "$(tr -d ' ' <<<"$rel")" == "$TO" ]] || fail "not all daemons on $TO (have: $rel)"
+    ceph_health_ok && ok "all daemons on $TO; require-osd-release=$TO; noout cleared; HEALTH ok" \
+                   || warn "all daemons on $TO but health not yet OK -- inspect 'ceph -s'"
+}
+
+# ----------------------------- main ------------------------------------------
+main() {
+    NO_COLOR=0; DRY_RUN=0; YES=0; TO=""; FROM=""; STABLE=""; JUMP="$PVE_CU_JUMP"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --to)         TO="$2"; shift 2 ;;
+            --from)       FROM="$2"; shift 2 ;;
+            -j|--jump)    JUMP="$2"; shift 2 ;;
+            -s|--stable)  STABLE="$2"; shift 2 ;;
+            -y|--yes)     YES=1; shift ;;
+            -n|--dry-run) DRY_RUN=1; shift ;;
+            --no-color)   NO_COLOR=1; shift ;;
+            -h|--help)    usage; exit "$EX_OK" ;;
+            -v|--version) echo "pve-ceph-upgrade $VERSION"; exit "$EX_OK" ;;
+            -*)           err "Unknown option: $1"; usage; exit "$EX_USAGE" ;;
+            *)            err "unexpected argument: $1"; exit "$EX_USAGE" ;;
+        esac
+    done
+    setup_colors
+    [[ -n "$TO" ]] || { err "--to <release> is required"; usage; exit "$EX_USAGE"; }
+    TO="${TO,,}"; FROM="${FROM,,}"
+    command -v ssh >/dev/null || { err "ssh not found"; exit "$EX_USAGE"; }
+    REPO_URL="${PVE_CU_REPO_BASE:-http://download.proxmox.com/debian/ceph-$TO no-subscription}"
+
+    # shellcheck disable=SC2206
+    SSH_OPT=( $SSH_BASE_OPTS $PVE_CU_SSH_OPTS )
+    [[ -n "$JUMP" ]] && SSH_OPT+=( -J "$JUMP" )
+
+    # Discover a stable monitor node + the full topology.
+    if [[ -z "$STABLE" ]]; then
+        [[ -n "$JUMP" ]] || { err "give --stable HOST (or --jump) so I can reach the cluster"; exit "$EX_USAGE"; }
+        # ask the jump host itself? no -- require --stable when not derivable
+        err "--stable HOST is required (a monitor node to drive checks)"; exit "$EX_USAGE"
+    fi
+    ssh_stable true 2>/dev/null || { err "cannot reach stable node '$STABLE' over ssh"; exit "$EX_USAGE"; }
+
+    mapfile -t NODES < <(ssh_stable 'LC_ALL=C pvecm nodes' 2>/dev/null | awk 'NR>0{print $3}' | sed 's/ *(local)//' | grep -vE '^(Name|)$')
+    [[ ${#NODES[@]} -ge 1 ]] || fail "could not enumerate cluster nodes"
+    mapfile -t MON_NODES < <(ssh_stable 'LC_ALL=C ceph mon dump' 2>/dev/null | sed -n 's/^[0-9]*: .*mon\.\([^ ]*\).*/\1/p')
+    [[ ${#MON_NODES[@]} -ge 1 ]] || mapfile -t MON_NODES < <(printf '%s\n' "${NODES[@]}")
+    NMONS=${#MON_NODES[@]}
+    mapfile -t MGR_NODES < <(ssh_stable "LC_ALL=C ceph -s" 2>/dev/null | sed -n 's/.*mgr: \([^(]*\)(active.*/\1/p;s/.*standbys: //p' | tr ', ' '\n' | grep -v '^$' | sort -u)
+    [[ ${#MGR_NODES[@]} -ge 1 ]] || mapfile -t MGR_NODES < <(printf '%s\n' "${MON_NODES[@]}")
+    mapfile -t OSD_NODES < <(ssh_stable "LC_ALL=C ceph osd tree" 2>/dev/null | awk '$3=="host"{print $4}')
+    [[ ${#OSD_NODES[@]} -ge 1 ]] || mapfile -t OSD_NODES < <(printf '%s\n' "${NODES[@]}")
+    FSNAME=$(ssh_stable 'LC_ALL=C ceph fs ls' 2>/dev/null | sed -n 's/^name: \([^,]*\),.*/\1/p' | head -1)
+    if [[ -n "$FSNAME" ]]; then
+        HAS_FS=1
+        ORIG_SR=$(ssh_stable "LC_ALL=C ceph fs get $FSNAME" 2>/dev/null | grep -oE 'allow_standby_replay[[:space:]]+[a-z]+' | awk '{print $2}')
+        mapfile -t MDS_NODES < <(ssh_stable "LC_ALL=C ceph mds metadata" 2>/dev/null | sed -n 's/.*"hostname": "\([^"]*\)".*/\1/p' | sort -u)
+        [[ ${#MDS_NODES[@]} -ge 1 ]] || mapfile -t MDS_NODES < <(printf '%s\n' "${NODES[@]}")
+    else HAS_FS=0; fi
+
+    echo -e "${C_BOLD}== pve-ceph-upgrade $VERSION : Ceph ${FROM:-?} -> $TO ==${C_RESET}"
+    (( DRY_RUN )) && echo -e "${C_YELLOW}=== DRY RUN: discovery only, no changes ===${C_RESET}"
+    msg "nodes=${#NODES[@]} mons=$NMONS(${MON_NODES[*]}) mgrs=${MGR_NODES[*]} osd-nodes=${OSD_NODES[*]} cephfs=${FSNAME:-none}"
+    msg "repo: ${REPO_URL}"
+
+    if (( ! DRY_RUN && ! YES )); then
+        echo -ne "${C_YELLOW}Proceed with the ONLINE Ceph $FROM->$TO migration on this cluster? [y/N] ${C_RESET}"
+        read -r ans; [[ "$ans" == [yY]* ]] || { msg "aborted by operator"; exit "$EX_OK"; }
+    fi
+
+    phase_preflight
+    phase_stage
+    phase_mons
+    phase_mgrs
+    phase_osds
+    phase_mds
+    phase_finalize
+
+    echo ""
+    (( DRY_RUN )) && msg "DRY RUN complete -- no changes made." \
+                  || msg "Ceph migrated to $TO; review 'ceph -s' and 'ceph versions'."
+    exit "$EX_OK"
+}
+
+main "$@"

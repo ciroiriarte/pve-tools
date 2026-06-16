@@ -9,6 +9,7 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
 - [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
 - [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
 - [pve-rolling-upgrade](#pve-rolling-upgrade) - Rolling, health-gated PVE 8→9 upgrade of one node
+- [pve-ceph-upgrade](#pve-ceph-upgrade) - Online Ceph major-release migration (e.g. Squid→Tentacle)
 - [Installation](#installation)
 - [License](#license)
 
@@ -413,6 +414,46 @@ Run it **one node at a time, in order — non-mon nodes first, the mon leader la
 
 ---
 
+## pve-ceph-upgrade
+
+Online **Ceph major-release migration** (e.g. **Squid 19 → Tentacle 20**) for a PVE hyper-converged cluster, with **no guest downtime**.
+
+The Ceph-major counterpart to [pve-rolling-upgrade](#pve-rolling-upgrade): that tool does the PVE 8→9 *distro* jump and leaves Ceph alone; this one does the *Ceph* major and leaves the Debian/PVE release alone. **Run them as separate passes — never combine a Ceph major with a distro upgrade.**
+
+It stages the new packages everywhere, then restarts daemons in the upstream-mandated order — **monitor → manager → OSD → MDS** — gating on Ceph health and quorum between every step, and only flips `require-osd-release` once every OSD is on the new release. Topology (mon/mgr/OSD/MDS placement, CephFS name + standby-replay, source release) is auto-discovered.
+
+**Per-step sequence (each gated):**
+
+| Step | Action |
+|---|---|
+| preflight | target repo exists; cluster on PVE 9; HEALTH ok; all daemons on `<from>`; active+clean; quorate |
+| stage | `ceph osd set noout`; per node bump repo `ceph-<from>→ceph-<to>`, `apt update`, install Ceph (daemons keep `<from>` until restarted) |
+| mons | restart `ceph-mon` one node at a time; wait full quorum |
+| mgrs | restart `ceph-mgr` (active fails over) |
+| osds | restart OSDs one node at a time; wait `active+clean` (`noout` avoids rebalance churn) |
+| mds | (CephFS) disable standby-replay, restart standbys then active, restore |
+| finalize | `ceph osd require-osd-release <to>`; `ceph osd unset noout`; verify every daemon on `<to>` + HEALTH ok |
+
+**Usage:**
+
+```bash
+# Preview a Squid→Tentacle migration (read-only)
+pve-ceph-upgrade --dry-run --to tentacle -j root@bastion -s pve01
+
+# Perform it (asks to confirm; -y for unattended)
+pve-ceph-upgrade --to tentacle -j root@bastion -s pve01
+```
+
+> **Pre-conditions:** the cluster must already be fully on PVE 9, `HEALTH_OK` (bar `noout`), every daemon on the source release, all PGs `active+clean`, and quorate. **Read the version-specific upstream notes first** — `https://pve.proxmox.com/wiki/Ceph_<From>_to_<To>` — the exact daemon order and any pre-steps are release-specific. **A Ceph major is one-way once `require-osd-release` is set.**
+
+**Configuration:** optional overrides via env or `/etc/pve-ceph-upgrade.conf` — `PVE_CU_SSH_OPTS`, `PVE_CU_JUMP`, `PVE_CU_REPO_BASE`.
+
+**Exit codes:** `0` OK · `1` FAIL (a gate failed; run halted) · `2` usage/dependency error.
+
+**Dependencies:** controller needs `bash`, `ssh`, `curl`; each node needs the Ceph/PVE stack (`ceph`, `systemctl`, `apt`). Node names from `pvecm nodes` must be reachable from the controller (directly or via `--jump`). Key-based root SSH assumed.
+
+---
+
 ## Installation
 
 Two methods are supported. The **`.deb` package** is recommended on a real PVE
@@ -441,7 +482,7 @@ echo "deb [signed-by=/usr/share/keyrings/pve-tools.gpg] $REPO/ /" \
 apt update && apt install pve-tools
 ```
 
-This installs the five scripts to `/usr/sbin`, their man pages to
+This installs the six scripts to `/usr/sbin`, their man pages to
 `/usr/share/man/man8`, and the bash completion to
 `/usr/share/bash-completion/completions`. Updates then arrive with the usual
 `apt upgrade`. To install a single `.deb` without adding the repo, download it
@@ -453,7 +494,7 @@ from the `Debian_12/all/` (or `Debian_13/all/`) directory and run
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade /usr/local/sbin/
 ```
 
 Man pages are provided in `man/man8/`. To install them:

@@ -1,0 +1,165 @@
+.\" pve-ceph-upgrade - Online Ceph major-release migration for a PVE cluster
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-CEPH\-UPGRADE 8 "2026-06-16" "1.0.0" "Proxmox VE Tools"
+.SH NAME
+pve\-ceph\-upgrade \- online Ceph major\-release migration for a Proxmox VE hyper\-converged cluster
+.SH SYNOPSIS
+.B pve\-ceph\-upgrade
+.B \-\-to
+.I release
+.RI [ options ]
+.br
+.B pve\-ceph\-upgrade
+.B \-\-to
+.I release
+.RB [ \-\-from
+.IR release ]
+.RB [ \-\-jump
+.IR user @ host ]
+.RB [ \-\-stable
+.IR host ]
+.RB [ \-\-dry\-run ]
+.SH DESCRIPTION
+.B pve\-ceph\-upgrade
+migrates the Ceph cluster embedded in a Proxmox VE hyper\-converged cluster from
+one major release to the next (for example
+.I squid
+to
+.IR tentacle ),
+.B online
+and with no guest downtime. It stages the new packages on every node, then
+restarts the daemons in the order the upstream procedure mandates \(em
+.BR monitor " \(-> " manager " \(-> " OSD " \(-> " MDS
+\(em gating on Ceph health and quorum between every step, and only flips
+.B require\-osd\-release
+once every OSD reports the new release.
+.PP
+This is the Ceph\-major counterpart to
+.BR pve\-rolling\-upgrade (8):
+that tool performs the PVE 8\(->9 distribution jump and deliberately leaves Ceph
+on its current major; this tool performs the Ceph major and touches nothing
+about the Debian/PVE release. Run them as
+.B separate passes
+\(em never combine a Ceph major with a distribution upgrade.
+.PP
+Topology (cluster nodes, monitor/manager/OSD/MDS placement, CephFS name and its
+standby\-replay setting, source release) is
+.B auto\-discovered
+from the live cluster.
+.SH SAFETY
+.B This is a production, hard\-to\-reverse operation.
+A Ceph major upgrade is one\-way once
+.B require\-osd\-release
+is set. Always read the version\-specific upstream notes first \(em
+.I https://pve.proxmox.com/wiki/Ceph_<From>_to_<To>
+\(em as the exact daemon order and any pre\-steps are release\-specific. The
+cluster must already be fully on PVE 9 (Trixie), HEALTH_OK (bar a
+.I noout
+warning), with every daemon on the source release, all PGs
+.IR active+clean ,
+and quorate.
+.B \-\-dry\-run
+performs read\-only discovery and prints the plan. The tool
+.B hard\-stops
+(non\-zero exit) on any failed gate.
+.SH OPTIONS
+.TP
+.BR \-\-to " " \fIrelease\fR
+Target Ceph release, e.g.
+.IR tentacle .
+.B Required.
+.TP
+.BR \-\-from " " \fIrelease\fR
+Source release. Default: auto\-detect from
+.BR "ceph versions" .
+.TP
+.BR \-j ", " \-\-jump " " \fIuser\fR@\fIhost\fR
+ProxyJump/bastion host used to reach the cluster.
+.TP
+.BR \-s ", " \-\-stable " " \fIhost\fR
+A monitor node used to drive cluster\-wide Ceph and quorum checks. Required when
+the cluster cannot otherwise be reached.
+.TP
+.BR \-y ", " \-\-yes
+Proceed without the interactive confirmation (required for unattended runs).
+.TP
+.BR \-n ", " \-\-dry\-run
+Discover and print the plan without changing anything.
+.TP
+.B \-\-no\-color
+Disable ANSI colour (also disabled automatically when stdout is not a TTY).
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.TP
+.BR \-v ", " \-\-version
+Print the version and exit.
+.SH "EXIT STATUS"
+.TP
+.B 0
+OK \(em every daemon migrated to the target release and health is OK.
+.TP
+.B 1
+FAIL \(em a pre\-condition or gate failed and the run halted; inspect Ceph.
+.TP
+.B 2
+USAGE \(em bad invocation, a missing dependency, or the cluster was unreachable.
+.SH ENVIRONMENT
+Overrides may be set in the environment or in
+.IR /etc/pve\-ceph\-upgrade.conf
+(a sourced shell file).
+.TP
+.B PVE_CU_SSH_OPTS
+Extra
+.BR ssh (1)
+options (ProxyJump, IdentityFile, ...).
+.TP
+.B PVE_CU_JUMP
+Convenience ProxyJump host (same as
+.BR \-\-jump ).
+.TP
+.B PVE_CU_REPO_BASE
+Override the Ceph repository (base URL and component). Default:
+.I http://download.proxmox.com/debian/ceph\-<to>
+with the
+.I no\-subscription
+component.
+.SH EXAMPLES
+.PP
+Preview a Squid\(->Tentacle migration through a bastion (no changes):
+.PP
+.RS
+.EX
+pve\-ceph\-upgrade \-\-dry\-run \-\-to tentacle \-j root@bastion \-s pve01
+.EE
+.RE
+.PP
+Perform the migration (asks to confirm first):
+.PP
+.RS
+.EX
+pve\-ceph\-upgrade \-\-to tentacle \-j root@bastion \-s pve01
+.EE
+.RE
+.SH REQUIREMENTS
+Controller:
+.BR bash ", " ssh ", " curl .
+Each node: the Ceph/PVE stack
+.RB ( ceph ", " systemctl ", " apt ).
+Node names from
+.BR "pvecm nodes"
+must be reachable from the controller (directly or through
+.BR \-\-jump ).
+Key\-based root SSH is assumed.
+.SH "SEE ALSO"
+.BR pve\-rolling\-upgrade (8),
+.BR pve\-sdn\-healthcheck (8),
+.BR ceph (8)
+.PP
+Upstream procedure:
+.I https://pve.proxmox.com/wiki/Ceph_Squid_to_Tentacle
+.SH AUTHOR
+Ciro Iriarte <ciro.iriarte+software@gmail.com>
+.SH COPYRIGHT
+Copyright (c) 2024-2026 Ciro Iriarte. MIT License.

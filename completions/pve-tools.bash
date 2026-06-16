@@ -181,3 +181,30 @@ _pve_rolling_upgrade() {
 }
 
 complete -F _pve_rolling_upgrade pve-rolling-upgrade
+
+# --- pve-ceph-upgrade ---------------------------------------------------------
+
+_pve_ceph_upgrade() {
+    local cur prev opts
+    _init_completion || return
+
+    opts="--to --from -j --jump -s --stable -y --yes
+          -n --dry-run --no-color -h --help -v --version"
+
+    case "$prev" in
+        --to|--from)
+            COMPREPLY=( $(compgen -W "quincy reef squid tentacle" -- "$cur") )
+            return
+            ;;
+        -j|--jump|-s|--stable)
+            # Host/IP; no useful default completions
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+
+complete -F _pve_ceph_upgrade pve-ceph-upgrade
