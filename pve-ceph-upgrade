@@ -134,8 +134,21 @@ EOF
 
 # ----------------------------- ssh plumbing ----------------------------------
 declare -a SSH_OPT
-ssh_to()     { local h="$1"; shift; ssh "${SSH_OPT[@]}" "root@$h" "$@"; }
-ssh_stable() { ssh "${SSH_OPT[@]}" "root@$STABLE" "$@"; }
+declare -A _ADDR
+                     # </dev/null so addr_of's resolver ssh can't swallow a heredoc
+                     # destined for an ssh_to() call (queries never need stdin).
+ssh_stable() { ssh "${SSH_OPT[@]}" "root@$STABLE" "$@" </dev/null; }
+# Resolve a node name to an address reachable from the controller. A controller
+# often cannot resolve cluster-internal node names, so ask the stable node
+# (getent) and fall back to the name itself when resolution is unavailable.
+addr_of() {
+    local n="$1"
+    [[ -n "${_ADDR[$n]:-}" ]] && { printf '%s' "${_ADDR[$n]}"; return; }
+    local a; a=$(ssh_stable "getent hosts $n 2>/dev/null" | awk '{print $1; exit}')
+    [[ -n "$a" ]] || a="$n"
+    _ADDR[$n]="$a"; printf '%s' "$a"
+}
+ssh_to()     { local h; h=$(addr_of "$1"); shift; ssh "${SSH_OPT[@]}" "root@$h" "$@"; }
 
 # Ceph all-PGs clean iff the pgs: line carries exactly one state: active+clean.
 ceph_clean() {
@@ -152,6 +165,13 @@ ceph_health_ok() {
     ! grep -E '^\[(WRN|ERR)\]' <<<"$h" | grep -qvi 'noout'
 }
 wait_clean() { local i; for i in $(seq "${1:-45}"); do ceph_clean && return 0; sleep 10; done; return 1; }
+# True iff every daemon of the given type (mon|mgr|osd|mds) runs $TO and none run $FROM.
+ver_all_on() {
+    local out; out=$(ssh_stable "LC_ALL=C ceph $1 versions" 2>/dev/null)
+    [[ -n "$out" ]] || return 1
+    grep -qiw "$FROM" <<<"$out" && return 1
+    grep -qiw "$TO" <<<"$out"
+}
 
 # ----------------------------- phases ----------------------------------------
 phase_preflight() {
@@ -224,7 +244,10 @@ phase_mons() {
         [[ -n "$okq" ]] || fail "$n: quorum not restored to $NMONS after mon restart"
         ok "$n: mon back, quorum=$NMONS"
     done
-    (( DRY_RUN )) || ok "min_mon_release: $(ssh_stable 'LC_ALL=C ceph mon dump 2>/dev/null | sed -n "s/min_mon_release \(.*\)/\1/p"')"
+    if (( ! DRY_RUN )); then
+        ver_all_on mon || fail "monitors not on $TO after restart -- package stage did not upgrade Ceph (verify the repo points at ceph-$TO and check 'ceph mon versions')"
+        ok "all monitors on $TO; min_mon_release: $(ssh_stable 'LC_ALL=C ceph mon dump 2>/dev/null | sed -n "s/min_mon_release \(.*\)/\1/p"')"
+    fi
 }
 
 phase_mgrs() {
@@ -246,8 +269,12 @@ phase_osds() {
         ssh_to "$n" 'systemctl restart ceph-osd.target' || fail "$n: osd restart failed"
         sleep 5
         wait_clean 60 || fail "$n: Ceph did not return to active+clean after OSD restart"
-        ok "$n: OSDs back on $TO, active+clean"
+        ok "$n: OSDs restarted, active+clean"
     done
+    if (( ! DRY_RUN )); then
+        ver_all_on osd || fail "OSDs not all on $TO after restarts -- check 'ceph osd versions'"
+        ok "all OSDs on $TO"
+    fi
 }
 
 phase_mds() {
