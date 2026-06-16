@@ -15,13 +15,15 @@ set -euo pipefail
 #   2. Download cloud image (cached in /var/tmp/pve-cloud-images/)
 #   3. Probe image for precise OS version via virt-cat (point releases)
 #   4. Optionally inject qemu-guest-agent via virt-customize
-#   5. Create VM shell with EFI, cloud-init, and serial console
+#   5. Create VM shell with EFI, cloud-init, serial console, and an explicit
+#      migration-safe CPU baseline matched to the guest's required x86-64
+#      microarchitecture level (EL10 etc. need v3 — see cpu_type_for)
 #   6. Import disk and attach to SCSI bus
 #   7. Convert VM to template
 #
 # Reference: https://iriarte.it/datacenter/2025/02/13/PVE-Cloud-Images.html
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 # --- Colors (disabled when stdout is not a terminal) --------------------------
 if [[ -t 1 ]]; then
@@ -80,6 +82,16 @@ DISTRO_FILTER=""
 MAX_VERSIONS=2
 ARCH="x86_64"
 TIMESTAMP=$(date +%Y%m%d%H%M)
+
+# CPU baseline for the sealed template. "auto" picks a migration-safe x86-64
+# microarchitecture level matched to the guest OS (see cpu_type_for); pass an
+# explicit value (e.g. host, max, x86-64-v3) to override.
+CPU_TYPE="auto"
+# Fallback baseline for guests with no special requirement. x86-64-v2-AES is a
+# QEMU-defined, migration-safe model satisfied by any remotely modern host —
+# unlike "host"/"max" passthrough, which breaks live migration across mixed
+# CPUs. EL10 and other v3-compiled guests are bumped up by cpu_type_for.
+DEFAULT_CPU_TYPE="x86-64-v2-AES"
 
 # --- API mode -----------------------------------------------------------------
 API_MODE=0
@@ -668,6 +680,33 @@ set_freebsd_agent_notes() {
     fi
 }
 
+# --- CPU baseline selection ---------------------------------------------------
+# Resolve the x86-64 microarchitecture level the sealed template should expose.
+# Some guests are compiled for a higher baseline than the QEMU default and will
+# kernel-panic at init ("Attempted to kill init! exitcode=0x00007f00") on a vCPU
+# that lacks the required instructions:
+#   - RHEL/Rocky/Oracle (and rebuilds) 10+ are built for x86-64-v3 (AVX2, BMI,
+#     FMA, ...). A v2 vCPU dies before reaching userspace.
+# Anything without a known requirement gets DEFAULT_CPU_TYPE. We always emit an
+# explicit, migration-safe model rather than host/max passthrough so clones run
+# on any node in the cluster and survive live migration.
+#
+#   $1 = family (rocky, oracle, debian, ...)
+#   $2 = key    (family-version[-suffix], e.g. rocky-10.0, ubuntu-2204)
+cpu_type_for() {
+    local family="$1" key="$2"
+    local ver="${key#"${family}-"}"   # strip leading "family-"
+    ver="${ver%-lvm}"                 # strip trailing "-lvm" variant marker
+    local major="${ver%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || major=0
+    case "$family" in
+        rocky|oracle)
+            (( major >= 10 )) && { echo "x86-64-v3"; return; }
+            ;;
+    esac
+    echo "$DEFAULT_CPU_TYPE"
+}
+
 # --- Import a single image as template (local mode) ---------------------------
 import_single_local() {
     local idx="$1"
@@ -754,13 +793,19 @@ import_single_local() {
     local ostype="l26"
     [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]] && ostype="other"
 
+    # Resolve the CPU baseline. "auto" matches the guest's required x86-64
+    # microarch level (key is now finalized by the version probe above).
+    local cpu_type="$CPU_TYPE"
+    [[ "$cpu_type" == "auto" ]] && cpu_type=$(cpu_type_for "${IMG_FAMILY[$idx]}" "$key")
+    ok "CPU baseline: cputype=${cpu_type}"
+
     run qm create "$vmid" --name "$tpl_name" \
         --cores 2 --memory 2048 \
         --net0 "virtio,firewall=1,bridge=${BRIDGE}" \
         --scsihw virtio-scsi-pci \
         --bios ovmf --machine q35 \
         --agent enabled=1 --ostype "$ostype" \
-        --cpu cputype=max \
+        --cpu "cputype=${cpu_type}" \
         --serial0 socket --vga serial0
 
     # Import cloud image disk into PVE storage.
@@ -907,10 +952,16 @@ import_single_api() {
     local ostype="l26"
     [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]] && ostype="other"
 
+    # Resolve the CPU baseline. API mode has no virt-cat probe, so the version
+    # comes from the catalog key (e.g. rocky-10 → x86-64-v3).
+    local cpu_type="$CPU_TYPE"
+    [[ "$cpu_type" == "auto" ]] && cpu_type=$(cpu_type_for "${IMG_FAMILY[$idx]}" "$key")
+    ok "CPU baseline: cputype=${cpu_type}"
+
     msg "Creating VM ${vmid}..."
     if (( DRY_RUN )); then
         echo -e "   ${C_YELLOW}[dry-run]${C_RESET} POST nodes/${API_NODE}/qemu"
-        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   vmid=${vmid} name=${tpl_name} cores=2 memory=2048"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   vmid=${vmid} name=${tpl_name} cores=2 memory=2048 cpu=cputype=${cpu_type}"
     else
         local response upid
         response=$(pve_api POST "nodes/${API_NODE}/qemu" \
@@ -920,7 +971,7 @@ import_single_api() {
             "scsihw=virtio-scsi-pci" \
             "bios=ovmf" "machine=q35" \
             "agent=enabled=1" "ostype=${ostype}" \
-            "cpu=cputype=max" \
+            "cpu=cputype=${cpu_type}" \
             "serial0=socket" "vga=serial0") || {
             err "Failed to create VM ${vmid}"
             return 1
@@ -1124,6 +1175,10 @@ Options:
   -S, --disk-size SIZE  Resize boot disk (e.g. 60G; default: keep original)
   -I, --start-id ID     Starting VM ID (default: 9000)
   -d, --distro NAME     Filter by family: debian ubuntu rocky opensuse oracle freebsd
+  -c, --cpu-type TYPE   Template CPU model (default: auto). 'auto' picks a
+                        migration-safe x86-64 baseline matched to the guest
+                        (EL10+ → x86-64-v3, else x86-64-v2-AES). Pass an explicit
+                        PVE cputype (e.g. host, max, x86-64-v3) to override.
       --force           Replace existing templates with same VMID
       --no-customize    Skip virt-customize (guest-agent injection, etc.)
       --arch ARCH       Target architecture (default: x86_64)
@@ -1176,6 +1231,7 @@ main() {
             --disk-size|-S)    DISK_SIZE="$2"; shift 2 ;;
             --start-id|-I)     START_ID="$2"; shift 2 ;;
             --distro|-d)       DISTRO_FILTER="$2"; shift 2 ;;
+            --cpu-type|-c)     CPU_TYPE="$2"; shift 2 ;;
             --force)           FORCE=1; shift ;;
             --no-customize)    CUSTOMIZE=0; shift ;;
             --dry-run|-n)      DRY_RUN=1; shift ;;
