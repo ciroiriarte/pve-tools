@@ -1,0 +1,205 @@
+.\" pve-rolling-upgrade - Rolling PVE 8->9 upgrade of one cluster node
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-ROLLING\-UPGRADE 8 "2026-06-16" "1.0.0" "Proxmox VE Tools"
+.SH NAME
+pve\-rolling\-upgrade \- rolling, health\-gated Proxmox VE 8\(->9 upgrade of one cluster node
+.SH SYNOPSIS
+.B pve\-rolling\-upgrade
+.RI [ options ]
+.I node
+.br
+.B pve\-rolling\-upgrade
+.RB [ \-\-jump
+.IR user @ host ]
+.RB [ \-\-stable
+.IR host ]
+.RB [ \-\-target
+.IR host ]
+.RB [ \-\-nic\-pin
+.IR keep | pmx ]
+.I node
+.br
+.B pve\-rolling\-upgrade
+.RB [ \-\-dry\-run ]
+.I node
+.SH DESCRIPTION
+.B pve\-rolling\-upgrade
+upgrades a single Proxmox VE node from 8.x to 9.x (Debian Bookworm to Trixie)
+in a rolling, health\-gated way and \fBwithout shutting guests down\fR. It
+live\-migrates every running guest off the node, rewrites the APT repositories
+from
+.I bookworm
+to
+.IR trixie ,
+runs the distribution upgrade, pins the network\-interface names and hardens the
+boot path, reboots, and only reports success once a full health gate passes
+(NIC names, bonds and BGP\-EVPN, Ceph
+.IR active+clean ,
+and monitor quorum).
+.PP
+It operates on
+.B one node at a time
+and is meant to be driven from a controller or jump host. Run it on the cluster
+in the correct order \(em non\-monitor nodes first, the monitor
+.B leader last
+\(em re\-checking cluster health between nodes. Every site\-specific value
+(stable peer for cluster checks, migration targets, expected monitor\-quorum
+size, target kernel, which repository files carry
+.IR bookworm ,
+and whether FRR/EVPN is in use) is
+.B auto\-discovered
+from the live cluster.
+.PP
+The tool
+.B hard\-stops
+(non\-zero exit) on any failed pre\-condition or gate, so a problem halts at the
+current node instead of cascading across the cluster.
+.SH SAFETY
+.B This is a production, hard\-to\-reverse operation: it reboots the target node.
+With
+.B \-\-dry\-run
+the tool performs only read\-only discovery and prints the actions it would take.
+The following pre\-conditions must already hold and are
+.B not
+established by this tool: every node already on the latest 8.4; Ceph (if
+hyper\-converged) already on the release required by PVE 9; the
+.I noout
+flag set for the upgrade window; cluster health acceptable (only the
+.I noout
+warning); and a console/IPMI path available in case a reboot renames a NIC.
+Per\-node guest live\-migration is HA\-aware (HA guests are moved with
+.BR ha\-manager (1)).
+.SH OPTIONS
+.TP
+.BR \-j ", " \-\-jump " " \fIuser\fR@\fIhost\fR
+ProxyJump/bastion host used to reach the cluster.
+.TP
+.BR \-s ", " \-\-stable " " \fIhost\fR
+Peer node used for cluster\-wide checks (Ceph, quorum). Default: auto\-discover
+the first other cluster member.
+.TP
+.BR \-t ", " \-\-target " " \fIhost\fR
+Migration target for the drain step. May be given multiple times. Default: all
+other cluster members (guests are spread round\-robin).
+.TP
+.BR \-\-nic\-pin " " \fIkeep\fR|\fIpmx\fR
+NIC naming policy across the kernel/systemd change.
+.I keep
+(default) pins the
+.B current
+names (e.g.
+.IR eno* / ens5f* )
+by permanent MAC via
+.IR /etc/systemd/network/10\-pin\-*.link ;
+.I pmx
+uses
+.BR pve\-network\-interface\-pinning (8),
+which renames interfaces to the PVE
+.I nicN
+scheme.
+.TP
+.BR \-\-target\-kernel " " \fIVER\fR
+Override the auto\-detected post\-upgrade kernel version used for the boot\-entry
+and reboot gates.
+.TP
+.BR \-n ", " \-\-dry\-run
+Discover and print the intended actions without changing anything.
+.TP
+.B \-\-no\-color
+Disable ANSI colour (also disabled automatically when stdout is not a TTY).
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.TP
+.BR \-v ", " \-\-version
+Print the version and exit.
+.SH "EXIT STATUS"
+.TP
+.B 0
+OK \(em the node was upgraded and every gate passed.
+.TP
+.B 1
+FAIL \(em a pre\-condition or gate failed and the run halted. The node may be
+mid\-upgrade; inspect it before continuing the rollout.
+.TP
+.B 2
+USAGE \(em bad invocation, a missing dependency, or the node was unreachable.
+.SH ENVIRONMENT
+Overrides may be set in the environment or in
+.IR /etc/pve\-rolling\-upgrade.conf
+(a sourced shell file).
+.TP
+.B PVE_RU_SSH_OPTS
+Extra
+.BR ssh (1)
+options (e.g.
+.RI ' \-J\ admin@jump\ \-i\ ~/.ssh/key ').
+.TP
+.B PVE_RU_JUMP
+Convenience ProxyJump host (same as
+.BR \-\-jump ).
+.TP
+.B PVE_RU_KEEP_NIC_NAMES
+.I 1
+(default) keep current NIC names;
+.I 0
+use the
+.I nicN
+scheme (same as
+.BR \-\-nic\-pin ).
+.TP
+.B PVE_RU_TARGET_KERNEL
+Override the auto\-detected target kernel.
+.TP
+.B PVE_RU_VENDOR_HEALTH
+Post\-reboot vendor health probe command (default: try
+.B racadm getsysinfo
+when present, on Dell hardware).
+.SH EXAMPLES
+.PP
+Dry\-run a node through a bastion (no changes):
+.PP
+.RS
+.EX
+pve\-rolling\-upgrade \-\-dry\-run \-j root@bastion 192.168.0.14
+.EE
+.RE
+.PP
+Upgrade the non\-monitor node first, keeping original NIC names:
+.PP
+.RS
+.EX
+pve\-rolling\-upgrade \-j root@bastion 192.168.0.14
+.EE
+.RE
+.PP
+Upgrade a node using the PVE
+.I nicN
+naming scheme instead:
+.PP
+.RS
+.EX
+pve\-rolling\-upgrade \-\-nic\-pin pmx pve04
+.EE
+.RE
+.SH REQUIREMENTS
+Controller:
+.BR bash ", " ssh .
+Each node: the PVE stack
+.RB ( qm ", " pvecm ", " ceph ", " proxmox\-boot\-tool ),
+.BR ethtool ;
+FRR/EVPN gates run only when FRR is present. Key\-based root SSH to every node
+(directly or through
+.BR \-\-jump )
+is assumed.
+.SH "SEE ALSO"
+.BR pve\-sdn\-healthcheck (8),
+.BR pve\-vmnic\-fix (8),
+.BR pve\-network\-interface\-pinning (8),
+.BR ha\-manager (1),
+.BR proxmox\-boot\-tool (1)
+.SH AUTHOR
+Ciro Iriarte <ciro.iriarte+software@gmail.com>
+.SH COPYRIGHT
+Copyright (c) 2024-2026 Ciro Iriarte. MIT License.

@@ -154,3 +154,30 @@ _pve_sdn_healthcheck() {
 }
 
 complete -F _pve_sdn_healthcheck pve-sdn-healthcheck
+
+# --- pve-rolling-upgrade ------------------------------------------------------
+
+_pve_rolling_upgrade() {
+    local cur prev opts
+    _init_completion || return
+
+    opts="-j --jump -s --stable -t --target --nic-pin --target-kernel
+          -n --dry-run --no-color -h --help -v --version"
+
+    case "$prev" in
+        --nic-pin)
+            COMPREPLY=( $(compgen -W "keep pmx" -- "$cur") )
+            return
+            ;;
+        -j|--jump|-s|--stable|-t|--target|--target-kernel)
+            # Host/IP or value; no useful default completions
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+
+complete -F _pve_rolling_upgrade pve-rolling-upgrade

@@ -8,6 +8,7 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
 - [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
 - [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
 - [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
+- [pve-rolling-upgrade](#pve-rolling-upgrade) - Rolling, health-gated PVE 8→9 upgrade of one node
 - [Installation](#installation)
 - [License](#license)
 
@@ -366,6 +367,52 @@ or unreachable node).
 
 ---
 
+## pve-rolling-upgrade
+
+Rolling, health-gated **Proxmox VE 8 → 9** upgrade (Debian Bookworm → Trixie) of **one cluster node at a time**, **without shutting guests down**.
+
+For each node it live-migrates every running guest off (HA-aware), rewrites the APT repos `bookworm → trixie`, runs the `dist-upgrade`, pins NIC names, hardens the boot path, reboots, and only declares success once a full health gate passes. It **hard-stops on any failed gate** so a problem halts at that node instead of cascading.
+
+**Portable by design** — stable peer, migration targets, mon-quorum size, target kernel, which repo files carry `bookworm`, and FRR/EVPN presence are all auto-discovered from the live cluster.
+
+**Per-node sequence (each step gated):**
+
+| Step | Action |
+|---|---|
+| pre-gate | Ceph all-PGs `active+clean` + cluster quorate |
+| drain | live-migrate every guest off (HA via `ha-manager`), wait until empty |
+| stage | repos `bookworm→trixie` (third-party only if a `trixie` suite exists), clean `apt update`, then `dist-upgrade` |
+| boot-prep | disable the re-added enterprise repo, install an rp_filter service (EVPN), pin NIC names, rebuild initramfs + boot |
+| reboot | boot_id-gated; wait for the node to return on the new kernel |
+| post-gate | NIC names as expected, FRR/EVPN up, Ceph `active+clean`, mon quorum restored, cluster quorate |
+
+**Usage:**
+
+```bash
+# Preview (read-only discovery, no changes) through a bastion
+pve-rolling-upgrade --dry-run -j root@bastion 192.168.0.14
+
+# Upgrade one node (keeps original eno*/ens5f* NIC names by default)
+pve-rolling-upgrade -j root@bastion 192.168.0.14
+
+# Use the PVE nicN naming scheme instead of keeping original names
+pve-rolling-upgrade --nic-pin pmx pve04
+```
+
+Run it **one node at a time, in order — non-mon nodes first, the mon leader last** — re-checking cluster health between nodes.
+
+**NIC naming:** `--nic-pin keep` (default) pins the *current* names (`eno*/ens5f*`) by permanent MAC, so the systemd naming-scheme change across the major jump cannot rename the EVPN/corosync underlay. `--nic-pin pmx` uses `pve-network-interface-pinning` (renames to the `nicN` scheme).
+
+> **Pre-conditions** (asserted by you, not the tool): every node already on the latest 8.4; Ceph (if hyper-converged) already on the PVE 9 release; `noout` set for the window; cluster healthy bar the `noout` warning; and console/IPMI access in case a reboot mis-names a NIC. **It reboots the node — production, hard-to-reverse.**
+
+**Configuration:** optional overrides via env or `/etc/pve-rolling-upgrade.conf` — `PVE_RU_SSH_OPTS` (e.g. ProxyJump/IdentityFile), `PVE_RU_JUMP`, `PVE_RU_KEEP_NIC_NAMES`, `PVE_RU_TARGET_KERNEL`, `PVE_RU_VENDOR_HEALTH`.
+
+**Exit codes:** `0` OK · `1` FAIL (a gate failed; run halted) · `2` usage/dependency error.
+
+**Dependencies:** controller needs `bash` and `ssh`; each node needs the PVE stack (`qm`, `pvecm`, `ceph`, `proxmox-boot-tool`) and `ethtool`. FRR/EVPN checks run only when FRR is present. Key-based root SSH to every node (directly or via `--jump`) is assumed.
+
+---
+
 ## Installation
 
 Two methods are supported. The **`.deb` package** is recommended on a real PVE
@@ -394,7 +441,7 @@ echo "deb [signed-by=/usr/share/keyrings/pve-tools.gpg] $REPO/ /" \
 apt update && apt install pve-tools
 ```
 
-This installs the four scripts to `/usr/sbin`, their man pages to
+This installs the five scripts to `/usr/sbin`, their man pages to
 `/usr/share/man/man8`, and the bash completion to
 `/usr/share/bash-completion/completions`. Updates then arrive with the usual
 `apt upgrade`. To install a single `.deb` without adding the repo, download it
@@ -406,7 +453,7 @@ from the `Debian_12/all/` (or `Debian_13/all/`) directory and run
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade /usr/local/sbin/
 ```
 
 Man pages are provided in `man/man8/`. To install them:

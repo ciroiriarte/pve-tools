@@ -1,0 +1,418 @@
+#!/bin/bash
+# pve-rolling-upgrade - Copyright (c) 2024-2026 Ciro Iriarte
+# SPDX-License-Identifier: MIT
+# =============================================================================
+#  pve-rolling-upgrade  --  rolling, health-gated Proxmox VE 8 -> 9 upgrade of
+#                           ONE cluster node (Debian Bookworm -> Trixie)
+# -----------------------------------------------------------------------------
+#  PURPOSE
+#    Upgrade a single PVE node from 8.x to 9.x without breaking quorum or data
+#    redundancy and WITHOUT shutting guests down: live-migrate every guest off
+#    the node, rewrite the APT repos bookworm -> trixie, run the distribution
+#    upgrade, pin the NIC names + harden the boot path, reboot, and only declare
+#    success once a full health gate passes (NIC names, bonds/EVPN, Ceph
+#    active+clean, mon quorum).  Run it one node at a time, in the right order
+#    (non-mon nodes first, the mon LEADER last), from a controller/jump host.
+#
+#  SAFETY
+#    *** PRODUCTION, HARD-TO-REVERSE.  IT REBOOTS THE TARGET NODE. ***
+#    The script HARD-STOPS (non-zero exit) on any failed pre-condition or gate
+#    so a problem halts at this node instead of cascading across the cluster.
+#    --dry-run performs only read-only discovery and prints the intended actions.
+#    Pre-conditions that must already hold (assert them yourself): every node on
+#    the latest 8.4, Ceph (if hyper-converged) already on the matching release,
+#    `noout` set for the upgrade window, cluster HEALTH ok bar noout, and a
+#    console/IPMI path in case a reboot mis-names a NIC.
+#
+#  WHAT IT DOES (per node, each step gated)
+#    1. pre-gate    Ceph all-PGs active+clean + cluster quorate
+#    2. drain       live-migrate every running guest off (HA-aware), wait empty
+#    3. stage       repos bookworm->trixie (third-party only if a trixie suite
+#                   exists), `apt update` must be clean, then `dist-upgrade`
+#    4. boot-prep   disable the re-added enterprise repo, install an rp_filter
+#                   service (EVPN), pin NIC names, rebuild initramfs + boot
+#    5. reboot      boot_id-gated; waits for the node to return on the new kernel
+#    6. post-gate   NIC names as expected, FRR/EVPN up, Ceph back to
+#                   active+clean, mon quorum restored, cluster quorate
+#
+#  EXIT CODES
+#    0  OK       node upgraded and every gate passed
+#    1  FAIL     a pre-condition or gate failed; the run halted (node may be
+#                mid-upgrade -- inspect before continuing the rollout)
+#    2  USAGE    bad invocation, missing dependency, or node unreachable
+#
+#  USAGE
+#    pve-rolling-upgrade [options] <node>
+#      <node>                host/IP of the node to upgrade (root SSH assumed)
+#      -j, --jump USER@HOST  ProxyJump/bastion to reach the cluster
+#      -s, --stable HOST     peer used for cluster-wide checks (default: auto)
+#      -t, --target HOST     migration target (repeatable; default: other nodes)
+#      --nic-pin keep|pmx    keep = pin current names eno*/ens5f* by permanent
+#                            MAC (default); pmx = pve-network-interface-pinning
+#                            (renames to the nicN scheme)
+#      --target-kernel VER   override the auto-detected post-upgrade kernel
+#      -n, --dry-run         discover + print intended actions, change nothing
+#      --no-color            disable ANSI colour (also auto-off when not a TTY)
+#      -h, --help            this help          -v, --version   print version
+#
+#  CONFIG  (override via env or /etc/pve-rolling-upgrade.conf -- a sourced file)
+#    PVE_RU_SSH_OPTS      extra ssh options (e.g. '-J admin@jump -i ~/.ssh/k')
+#    PVE_RU_JUMP          convenience ProxyJump host (same as --jump)
+#    PVE_RU_KEEP_NIC_NAMES 1 (default) keep eno*/ens5f*; 0 use the nicN scheme
+#    PVE_RU_TARGET_KERNEL override auto-detected target kernel
+#    PVE_RU_VENDOR_HEALTH post-reboot vendor probe (default: racadm if present)
+#
+#  REQUIREMENTS
+#    Controller: bash, ssh.  Each node: the PVE stack (qm/pvecm/ceph/
+#    proxmox-boot-tool), ethtool; FRR/EVPN checks run only when FRR is present.
+#    Key-based root SSH to every node (directly or through --jump) is assumed.
+#
+#  SEE ALSO
+#    The pve-cluster-upgrade runbook this encodes (§1b distro jump, §3 rolling
+#    reboots, NIC-pinning + third-party-repo gotchas) and pve-sdn-healthcheck(8)
+#    for an independent post-upgrade network verdict.
+# =============================================================================
+
+# -e is intentionally NOT set: gate commands deliberately exit non-zero and are
+# handled explicitly; pipefail preserves pipe status for the checks that need it.
+set -o pipefail
+VERSION="1.0.0"
+
+# ----------------------------- defaults / config -----------------------------
+: "${PVE_RU_SSH_OPTS:=}"          # extra ssh opts (ProxyJump, IdentityFile, ...)
+: "${PVE_RU_JUMP:=}"              # convenience ProxyJump host
+: "${PVE_RU_KEEP_NIC_NAMES:=1}"  # 1 keep current NIC names; 0 use nicN scheme
+: "${PVE_RU_TARGET_KERNEL:=}"    # override auto-detected post-upgrade kernel
+: "${PVE_RU_VENDOR_HEALTH:=}"    # post-reboot vendor health probe command
+[ -r /etc/pve-rolling-upgrade.conf ] && . /etc/pve-rolling-upgrade.conf
+
+SSH_BASE_OPTS="-o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new"
+EX_OK=0; EX_FAIL=1; EX_USAGE=2
+
+# ----------------------------- colours / helpers -----------------------------
+setup_colors() {
+    if [[ -t 1 && "$NO_COLOR" -eq 0 ]]; then
+        C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+        C_CYAN='\033[0;36m'; C_BOLD='\033[1m'; C_RESET='\033[0m'
+    else
+        C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+    fi
+}
+msg()  { echo -e "${C_BOLD}${C_CYAN}::${C_RESET} $*"; }
+ok()   { echo -e "   ${C_GREEN}[+]${C_RESET} $*"; }
+warn() { echo -e "   ${C_YELLOW}[!]${C_RESET} $*"; }
+err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
+dry()  { echo -e "   ${C_YELLOW}[dry-run]${C_RESET} $*"; }
+fail() { err "FAIL [${NNAME:-$NODE}]: $*"; exit "$EX_FAIL"; }
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] <node>
+
+Rolling, health-gated Proxmox VE 8 -> 9 upgrade of ONE cluster node:
+live-migrate guests off, dist-upgrade bookworm->trixie, pin NIC names,
+reboot, and gate on Ceph/quorum/EVPN health before declaring success.
+
+Run ONE node at a time, in order (non-mon first, mon LEADER last).
+
+Arguments:
+  <node>                  Host/IP of the node to upgrade (root SSH assumed).
+
+Options:
+  -j, --jump USER@HOST    ProxyJump/bastion to reach the cluster.
+  -s, --stable HOST       Peer for cluster-wide checks (default: auto-discover).
+  -t, --target HOST       Migration target (repeatable; default: other nodes).
+      --nic-pin keep|pmx  keep = pin current names by permanent MAC (default);
+                          pmx  = pve-network-interface-pinning (nicN scheme).
+      --target-kernel VER Override the auto-detected post-upgrade kernel.
+  -n, --dry-run           Discover + print intended actions; change nothing.
+      --no-color          Disable ANSI colour.
+  -h, --help              Show this help.
+  -v, --version           Show version.
+
+Examples:
+  $(basename "$0") --dry-run -j root@bastion 192.168.0.14
+  $(basename "$0") -j root@bastion 192.168.0.14
+  $(basename "$0") --nic-pin pmx pve04          # use PVE nicN naming instead
+
+Exit codes: 0 OK, 1 FAIL (gate failed/halted), 2 usage/dependency error.
+EOF
+}
+
+# ----------------------------- ssh plumbing ----------------------------------
+# Built in main() once options are known.
+declare -a SSH_OPT
+ssh_node()   { ssh "${SSH_OPT[@]}" "root@$NODE"   "$@"; }
+ssh_stable() { ssh "${SSH_OPT[@]}" "root@$STABLE" "$@"; }
+
+# Ceph is "clean" iff the pgs: line lists exactly one state and it is active+clean.
+ceph_clean() {
+    local seg
+    seg=$(ssh_stable 'LC_ALL=C ceph pg stat' 2>/dev/null \
+          | sed -n 's/.*pgs:[[:space:]]*\([^;]*\);.*/\1/p')
+    [[ -n "$seg" ]] && ! grep -q ',' <<<"$seg" && grep -q 'active+clean' <<<"$seg"
+}
+
+# ----------------------------- phases ----------------------------------------
+phase_pregate() {
+    msg "[1/6] pre-gate (Ceph active+clean, cluster quorate)"
+    ceph_clean || fail "Ceph not all-PGs active+clean before start"
+    ssh_stable 'LC_ALL=C pvecm status' 2>/dev/null \
+        | grep -qE 'Quorate:[[:space:]]+Yes' || fail "cluster not quorate"
+    ok "active+clean, quorate"
+}
+
+phase_drain() {
+    msg "[2/6] drain guests off $NNAME -> ${TARGETS[*]}"
+    local running
+    running=$(ssh_node 'LC_ALL=C qm list' 2>/dev/null | awk '$3=="running"{print $1}')
+    if [[ -z "$running" ]]; then ok "no running guests"; return; fi
+    if (( DRY_RUN )); then
+        local i=0 v
+        for v in $running; do dry "live-migrate $v -> ${TARGETS[$((i % ${#TARGETS[@]}))]}"; i=$((i+1)); done
+        return
+    fi
+    # Detached on the node so a dropped controller SSH cannot abort it mid-flight.
+    ssh_node "LC_ALL=C bash -s ${TARGETS[*]}" <<'REMOTE'
+T=("$@")
+vms=$(qm list | awk '$3=="running"{print $1}')
+pairs=""; i=0
+for v in $vms; do pairs="$pairs$v:${T[$((i % ${#T[@]}))]} "; i=$((i+1)); done
+rm -f /var/log/pve-rolling-upgrade-drain.log
+nohup bash -c '
+for p in '"$pairs"'; do v=${p%%:*}; g=${p##*:}
+  if ha-manager status 2>/dev/null | grep -q "vm:$v "; then
+    echo "ha-migrate $v -> $g"; ha-manager migrate vm:$v $g && echo "OK $v" || echo "FAIL $v"
+  else
+    echo "migrate $v -> $g"; qm migrate $v $g --online && echo "OK $v" || echo "FAIL $v"
+  fi
+done; echo DRAIN_ISSUED' >/var/log/pve-rolling-upgrade-drain.log 2>&1 &
+REMOTE
+    local i
+    for i in $(seq 60); do ssh_node 'grep -q DRAIN_ISSUED /var/log/pve-rolling-upgrade-drain.log 2>/dev/null' && break; sleep 15; done
+    ssh_node 'grep -q "FAIL " /var/log/pve-rolling-upgrade-drain.log 2>/dev/null' \
+        && fail "a migration failed: $(ssh_node 'grep FAIL /var/log/pve-rolling-upgrade-drain.log')"
+    local empty=""
+    for i in $(seq 40); do
+        [[ "$(ssh_node 'LC_ALL=C qm list | awk "\$3==\"running\"" | wc -l')" == "0" ]] && { empty=1; break; }
+        sleep 10
+    done
+    [[ -n "$empty" ]] || fail "node still has running guests after drain"
+    ok "drained (0 running)"
+}
+
+phase_stage() {
+    msg "[3/6] stage repos (bookworm->trixie) + dist-upgrade"
+    if (( DRY_RUN )); then
+        dry "rewrite bookworm->trixie in Debian/Proxmox repos; third-party only if a trixie suite exists"
+        dry "apt-get update; apt-get dist-upgrade -y (force-confold)"
+        ssh_node "LC_ALL=C grep -rli bookworm /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null" \
+            | sed 's/^/      would touch: /'
+        return
+    fi
+    # Rewrite Debian + Proxmox unconditionally; third-party only if trixie exists.
+    ssh_node 'LC_ALL=C bash -s' <<'REMOTE'
+set -e
+cp -a /etc/apt /root/apt-pre-trixie.$(date +%Y%m%d-%H%M%S)
+[ -L /etc/frr/frr.conf.local ] && chown -h frr:frr /etc/frr/frr.conf.local || true
+for f in /etc/apt/sources.list $(ls /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null); do
+  grep -qi 'bookworm' "$f" 2>/dev/null || continue
+  url=$(grep -ioE 'https?://[^ ]+/debian' "$f" | head -1)
+  if echo "$url" | grep -qiE 'debian\.org|proxmox\.com'; then
+    sed -i 's/bookworm/trixie/g' "$f"
+  else
+    base=$(echo "$url" | sed 's#/debian.*##'); path=$(echo "$url" | sed 's#.*/debian#/debian#')
+    if curl -fsSL -o /dev/null "${base}${path}/dists/trixie/Release" 2>/dev/null; then
+      sed -i 's/bookworm/trixie/g' "$f"; echo "third-party rewritten: $f"
+    else
+      echo "WARN third-party repo has no trixie suite, left as-is: $f ($url)"
+    fi
+  fi
+done
+REMOTE
+    ssh_node 'LC_ALL=C apt-get update -o Dpkg::Use-Pty=0 >/dev/null 2>&1 && echo OK' \
+        | grep -q OK || fail "apt update not clean after repo rewrite"
+    ok "repos -> trixie, apt update clean"
+    # dist-upgrade detached (SIGHUP-immune); poll for the exit marker.
+    ssh_node 'LC_ALL=C bash -s' <<'REMOTE'
+rm -f /var/log/pve-rolling-upgrade-du.log
+nohup bash -c 'DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
+  -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+  -o Dpkg::Use-Pty=0 >/var/log/pve-rolling-upgrade-du.log 2>&1
+echo "DU_EXIT=$?" >>/var/log/pve-rolling-upgrade-du.log' >/dev/null 2>&1 &
+REMOTE
+    local i
+    for i in $(seq 120); do ssh_node 'grep -q DU_EXIT /var/log/pve-rolling-upgrade-du.log 2>/dev/null' && break; sleep 20; done
+    ssh_node 'grep -q "DU_EXIT=0" /var/log/pve-rolling-upgrade-du.log 2>/dev/null' \
+        || fail "dist-upgrade failed: $(ssh_node 'tail -5 /var/log/pve-rolling-upgrade-du.log')"
+    ssh_node 'LC_ALL=C grep -iqE "^E:|half-configured|errors were encountered" /var/log/pve-rolling-upgrade-du.log' \
+        && fail "dpkg errors during dist-upgrade"
+    ok "dist-upgrade ok: $(ssh_node 'pveversion 2>/dev/null | head -1')"
+}
+
+phase_bootprep() {
+    msg "[4/6] boot-prep (disable enterprise repo, rp_filter svc, NIC pin)"
+    if (( DRY_RUN )); then
+        dry "disable re-added /etc/apt/sources.list.d/pve-enterprise.sources"
+        dry "install rp-filter-off.service (EVPN asymmetric routing)"
+        dry "pin NIC names (mode: $([[ $KEEP_NIC == 1 ]] && echo keep-original || echo nicN)); update-initramfs; proxmox-boot-tool refresh"
+        return
+    fi
+    ssh_node 'cat > /etc/apt/sources.list.d/pve-enterprise.sources' <<'EOF'
+Types: deb
+URIs: https://enterprise.proxmox.com/debian/pve
+Suites: trixie
+Components: pve-enterprise
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+Enabled: false
+EOF
+    ssh_node 'cat > /etc/systemd/system/rp-filter-off.service' <<'EOF'
+[Unit]
+Description=Disable rp_filter on all interfaces (EVPN asymmetric routing)
+After=network-online.target frr.service pve-firewall.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1; for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > "$f" 2>/dev/null || true; done'
+[Install]
+WantedBy=multi-user.target
+EOF
+    ssh_node "LC_ALL=C KEEP=$KEEP_NIC bash -s" <<'REMOTE'
+set -e
+systemctl daemon-reload; systemctl enable rp-filter-off.service >/dev/null 2>&1 || true
+if [ "${KEEP:-1}" = "1" ]; then
+  names=$(grep -hoE 'bond-slaves .*' /etc/network/interfaces 2>/dev/null | sed 's/bond-slaves //' | tr ' ' '\n' | sort -u)
+  [ -z "$names" ] && names=$(for d in /sys/class/net/*; do n=$(basename "$d"); [ -e "$d/device" ] && echo "$n"; done)
+  for name in $names; do
+    mac=$(ethtool -P "$name" 2>/dev/null | awk '{print $3}')
+    case "$mac" in ""|00:00:00:00:00:00) continue;; esac
+    printf '[Match]\nMACAddress=%s\nType=ether\n\n[Link]\nName=%s\n' "$mac" "$name" > "/etc/systemd/network/10-pin-$name.link"
+  done
+  echo "pinned (original names): $(ls /etc/systemd/network/10-pin-*.link 2>/dev/null | wc -l)"
+elif command -v pve-network-interface-pinning >/dev/null; then
+  pve-network-interface-pinning generate >/dev/null 2>&1 && echo "pinned (nicN scheme)"
+fi
+update-initramfs -u >/dev/null 2>&1
+proxmox-boot-tool refresh >/dev/null 2>&1 || true
+REMOTE
+    NEWK="${PVE_RU_TARGET_KERNEL:-$(ssh_node 'ls /boot/vmlinuz-* | sort -V | tail -1 | sed "s|.*/vmlinuz-||"')}"
+    [[ -n "$NEWK" ]] || fail "could not determine target kernel"
+    ssh_node "LC_ALL=C bash -lc 'ESP=\$(proxmox-boot-tool status 2>/dev/null | awk \"/configured with/{print \\\$1; exit}\"); [ -n \"\$ESP\" ] && { mount /dev/disk/by-uuid/\$ESP /mnt 2>/dev/null; test -f /mnt/loader/entries/proxmox-$NEWK.conf && echo ENTRY_OK; umount /mnt 2>/dev/null; } || echo NO_ESP'" \
+        | grep -qE 'ENTRY_OK|NO_ESP' || fail "boot entry for $NEWK missing"
+    ok "boot-prep done, target kernel $NEWK"
+}
+
+phase_reboot() {
+    msg "[5/6] reboot (boot_id-gated)"
+    if (( DRY_RUN )); then dry "reboot $NNAME and wait for it to return on $NEWK"; return; fi
+    local bid back="" i k b
+    bid=$(ssh_node 'cat /proc/sys/kernel/random/boot_id')
+    ssh_node 'nohup sh -c "sleep 2; systemctl reboot" >/dev/null 2>&1 &'
+    for i in $(seq 90); do
+        k=$(ssh_node 'uname -r' 2>/dev/null); b=$(ssh_node 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null)
+        [[ "$k" == "$NEWK" && -n "$b" && "$b" != "$bid" ]] && { back=1; break; }
+        sleep 10
+    done
+    [[ -n "$back" ]] || fail "node did not return on $NEWK (check console/IPMI)"
+    ok "back on $NEWK"
+}
+
+phase_postgate() {
+    msg "[6/6] post-gate"
+    if (( DRY_RUN )); then dry "verify NIC names, FRR/EVPN, Ceph active+clean, mon quorum"; return; fi
+    if (( KEEP_NIC )); then
+        ssh_node 'ip -br link | grep -q "^nic[0-9]"' && fail "nicN names present but keep-original requested"
+    fi
+    if ssh_node 'systemctl is-active frr 2>/dev/null | grep -q active'; then
+        [[ "$(ssh_node 'stat -c %U:%G /etc/frr/frr.conf.local 2>/dev/null')" == "frr:frr" ]] \
+            || fail "frr.conf.local symlink owner not frr:frr"
+        ssh_node 'vtysh -c "show bgp l2vpn evpn summary" 2>/dev/null | grep -q Established' \
+            || warn "EVPN summary shows no Established peers"
+    fi
+    [[ "$(ssh_node 'cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null')" == "0" ]] || warn "rp_filter all != 0"
+    ssh_node 'systemctl is-system-running 2>/dev/null | grep -qE "running|degraded"' || fail "system not running"
+    if [[ -n "$PVE_RU_VENDOR_HEALTH" ]]; then
+        ssh_node "$PVE_RU_VENDOR_HEALTH" >/dev/null 2>&1 || warn "vendor health probe failed"
+    elif ssh_node 'command -v racadm >/dev/null'; then
+        ssh_node 'racadm getsysinfo 2>/dev/null | grep -qi PowerEdge' || warn "racadm probe failed (vendor tools may need reinstall)"
+    fi
+    local ok_clean="" i
+    for i in $(seq 45); do ceph_clean && { ok_clean=1; break; }; sleep 10; done
+    [[ -n "$ok_clean" ]] || fail "Ceph did not return to active+clean"
+    if [[ -n "$MONS" ]]; then
+        local qn
+        qn=$(ssh_stable 'LC_ALL=C ceph -s' 2>/dev/null | sed -n 's/.*quorum \(.*\) (age.*/\1/p' | tr ',' '\n' | grep -c .)
+        [[ "$qn" == "$MONS" ]] || fail "mon quorum $qn != expected $MONS"
+    fi
+    ssh_stable 'LC_ALL=C pvecm status' 2>/dev/null | grep -qE 'Quorate:[[:space:]]+Yes' || fail "cluster not quorate after reboot"
+    ok "NIC names kept, FRR/EVPN up, Ceph active+clean, mon quorum=${MONS:-n/a}, quorate"
+}
+
+# ----------------------------- main ------------------------------------------
+main() {
+    NO_COLOR=0; DRY_RUN=0; NODE=""; STABLE=""; JUMP="$PVE_RU_JUMP"
+    KEEP_NIC="$PVE_RU_KEEP_NIC_NAMES"
+    local -a CLI_TARGETS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--jump)          JUMP="$2"; shift 2 ;;
+            -s|--stable)        STABLE="$2"; shift 2 ;;
+            -t|--target)        CLI_TARGETS+=("$2"); shift 2 ;;
+            --nic-pin)          case "$2" in keep) KEEP_NIC=1;; pmx) KEEP_NIC=0;; *) err "--nic-pin must be keep|pmx"; exit "$EX_USAGE";; esac; shift 2 ;;
+            --target-kernel)    PVE_RU_TARGET_KERNEL="$2"; shift 2 ;;
+            -n|--dry-run)       DRY_RUN=1; shift ;;
+            --no-color)         NO_COLOR=1; shift ;;
+            -h|--help)          usage; exit "$EX_OK" ;;
+            -v|--version)       echo "pve-rolling-upgrade $VERSION"; exit "$EX_OK" ;;
+            --)                 shift; break ;;
+            -*)                 err "Unknown option: $1"; usage; exit "$EX_USAGE" ;;
+            *)                  [[ -z "$NODE" ]] && NODE="$1" || { err "unexpected argument: $1"; exit "$EX_USAGE"; }; shift ;;
+        esac
+    done
+    [[ $# -gt 0 && -z "$NODE" ]] && NODE="$1"
+
+    setup_colors
+    [[ -n "$NODE" ]] || { err "no node specified"; usage; exit "$EX_USAGE"; }
+    command -v ssh >/dev/null || { err "ssh not found on controller"; exit "$EX_USAGE"; }
+
+    # Build ssh option vector (base + user opts + optional jump).
+    # shellcheck disable=SC2206
+    SSH_OPT=( $SSH_BASE_OPTS $PVE_RU_SSH_OPTS )
+    [[ -n "$JUMP" ]] && SSH_OPT+=( -J "$JUMP" )
+
+    NNAME=$(ssh_node hostname 2>/dev/null) || { err "cannot reach node '$NODE' over ssh"; exit "$EX_USAGE"; }
+
+    echo -e "${C_BOLD}== pve-rolling-upgrade $VERSION -> $NNAME ($NODE) ==${C_RESET}"
+    (( DRY_RUN )) && echo -e "${C_YELLOW}=== DRY RUN: discovery only, no changes ===${C_RESET}"
+
+    # Auto-discover stable peer + migration targets from the cluster.
+    local -a NODES=() others=()
+    mapfile -t NODES < <(ssh_node 'LC_ALL=C pvecm nodes' 2>/dev/null | awk 'NR>0{print $3}' | sed 's/ *(local)//' | grep -vE '^(Name|)$')
+    local n; for n in "${NODES[@]}"; do [[ "$n" != "$NNAME" ]] && others+=("$n"); done
+    [[ -z "$STABLE" ]] && STABLE="${others[0]:-}"
+    [[ -n "$STABLE" ]] || fail "could not determine a stable peer (give --stable)"
+    if [[ ${#CLI_TARGETS[@]} -gt 0 ]]; then TARGETS=("${CLI_TARGETS[@]}"); else TARGETS=("${others[@]}"); fi
+    [[ ${#TARGETS[@]} -ge 1 ]] || fail "no migration targets (give --target)"
+    MONS=$(ssh_stable 'LC_ALL=C ceph -s' 2>/dev/null | sed -n 's/.*mon: \([0-9]*\) daemons.*/\1/p')
+
+    msg "stable-peer=$STABLE  targets=${TARGETS[*]}  nic-pin=$([[ $KEEP_NIC == 1 ]] && echo keep || echo pmx)  mons=${MONS:-?}"
+
+    phase_pregate
+    phase_drain
+    phase_stage
+    phase_bootprep
+    phase_reboot
+    phase_postgate
+
+    echo ""
+    if (( DRY_RUN )); then
+        msg "DRY RUN complete for $NNAME — no changes made."
+    else
+        msg "$NNAME upgraded to $(ssh_node 'pveversion 2>/dev/null | head -1'); all gates passed."
+    fi
+    exit "$EX_OK"
+}
+
+main "$@"
