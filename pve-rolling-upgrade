@@ -76,7 +76,7 @@
 # -e is intentionally NOT set: gate commands deliberately exit non-zero and are
 # handled explicitly; pipefail preserves pipe status for the checks that need it.
 set -o pipefail
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ----------------------------- defaults / config -----------------------------
 : "${PVE_RU_SSH_OPTS:=}"          # extra ssh opts (ProxyJump, IdentityFile, ...)
@@ -251,10 +251,11 @@ REMOTE
 }
 
 phase_bootprep() {
-    msg "[4/6] boot-prep (disable enterprise repo, rp_filter svc, NIC pin)"
+    msg "[4/6] boot-prep (disable enterprise repo, rp_filter svc, NIC pin, CPU microcode)"
     if (( DRY_RUN )); then
         dry "disable re-added /etc/apt/sources.list.d/pve-enterprise.sources"
         dry "install rp-filter-off.service (EVPN asymmetric routing)"
+        dry "install vendor-matched CPU microcode (intel-microcode/amd64-microcode) via non-free-firmware"
         dry "pin NIC names (mode: $([[ $KEEP_NIC == 1 ]] && echo keep-original || echo nicN)); update-initramfs; proxmox-boot-tool refresh"
         return
     fi
@@ -292,6 +293,15 @@ if [ "${KEEP:-1}" = "1" ]; then
   echo "pinned (original names): $(ls /etc/systemd/network/10-pin-*.link 2>/dev/null | wc -l)"
 elif command -v pve-network-interface-pinning >/dev/null; then
   pve-network-interface-pinning generate >/dev/null 2>&1 && echo "pinned (nicN scheme)"
+fi
+# CPU microcode, vendor-matched (clears the pve8to9 microcode WARN; needs non-free-firmware).
+vend=$(awk -F: '/vendor_id/{gsub(/ /,"",$2);print $2;exit}' /proc/cpuinfo)
+case "$vend" in GenuineIntel) uc=intel-microcode;; AuthenticAMD) uc=amd64-microcode;; *) uc="";; esac
+if [ -n "$uc" ]; then
+  sed -i '/non-free-firmware/!s/ main contrib$/ main contrib non-free non-free-firmware/' /etc/apt/sources.list 2>/dev/null || true
+  apt-get update -o Dpkg::Use-Pty=0 >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$uc" -o Dpkg::Use-Pty=0 >/dev/null 2>&1 \
+    && echo "microcode: $uc installed ($vend)" || echo "microcode: $uc NOT installed (check non-free-firmware)"
 fi
 update-initramfs -u >/dev/null 2>&1
 proxmox-boot-tool refresh >/dev/null 2>&1 || true
