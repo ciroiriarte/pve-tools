@@ -76,7 +76,7 @@
 # -e is intentionally NOT set: gate commands deliberately exit non-zero and are
 # handled explicitly; pipefail preserves pipe status for the checks that need it.
 set -o pipefail
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ----------------------------- defaults / config -----------------------------
 : "${PVE_RU_SSH_OPTS:=}"          # extra ssh opts (ProxyJump, IdentityFile, ...)
@@ -150,7 +150,11 @@ ceph_clean() {
     local seg
     seg=$(ssh_stable 'LC_ALL=C ceph pg stat' 2>/dev/null \
           | sed -n 's/.*pgs:[[:space:]]*\([^;]*\);.*/\1/p')
-    [[ -n "$seg" ]] && ! grep -q ',' <<<"$seg" && grep -q 'active+clean' <<<"$seg"
+    [[ -n "$seg" ]] || return 1
+    # Clean = every PG state is active+clean; scrub/deep-scrub/snaptrim are benign
+    # modifiers. Any other state (remapped/backfill/degraded/peering/...) = not clean.
+    [[ -z "$(echo "$seg" | tr ',' '\n' | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//' \
+            | grep -vE '^active\+clean(\+(scrubbing|deep|snaptrim|snaptrim_wait))*$')" ]]
 }
 
 # ----------------------------- phases ----------------------------------------
