@@ -5,6 +5,11 @@ This guide covers how to provision VMs cloned from templates created by
 
 ## Contents
 
+- [Deployment Scenarios](#deployment-scenarios)
+  - [Scenario 1 — DHCP + SSH Key](#scenario-1--dhcp--ssh-key)
+  - [Scenario 2 — DHCP + Password](#scenario-2--dhcp--password)
+  - [Scenario 3 — Static IP + SSH Key](#scenario-3--static-ip--ssh-key)
+  - [Scenario 4 — Static IP + Password](#scenario-4--static-ip--password)
 - [How PVE cloud-init works](#how-pve-cloud-init-works)
 - [Hostname](#hostname)
 - [Timezone](#timezone)
@@ -23,6 +28,159 @@ This guide covers how to provision VMs cloned from templates created by
 - [FreeBSD (nuageinit)](#freebsd-nuageinit)
 - [Snippet storage setup](#snippet-storage-setup)
 - [Sample files](#sample-files)
+
+---
+
+## Deployment Scenarios
+
+Four common deployment patterns — each shows the full sequence of commands
+to clone a template, configure hostname, network, and authentication, and
+start the VM.
+
+All scenarios create a `cloudadmin` user with passwordless sudo.
+Hostname is set via the VM name in PVE (`--name`), which PVE writes into
+`meta-data` as `local-hostname` for cloud-init to pick up on first boot.
+
+| Scenario | Network   | Auth     | Snippet file            |
+|----------|-----------|----------|-------------------------|
+| 1        | DHCP      | SSH key  | `ci-user-basic.yaml`    |
+| 2        | DHCP      | Password | `ci-user-password.yaml` |
+| 3        | Static IP | SSH key  | `ci-user-basic.yaml`    |
+| 4        | Static IP | Password | `ci-user-password.yaml` |
+
+**One-time setup** — copy snippets to the PVE snippets storage before first use:
+
+```bash
+cp samples/ci-user-basic.yaml    /var/lib/vz/snippets/
+cp samples/ci-user-password.yaml /var/lib/vz/snippets/
+```
+
+Find the template VMID created by `pve-import-cloud-images`:
+
+```bash
+qm list | grep ci-
+```
+
+---
+
+### Scenario 1 — DHCP + SSH Key
+
+Edit `ci-user-basic.yaml` and replace the placeholder key in
+`ssh_authorized_keys` with your actual public key before deploying.
+
+```bash
+TMPL_ID=9000   # VMID of the cloud-init template (from qm list)
+VM_ID=100      # new VM VMID — must be unused
+VM_NAME=my-server
+
+qm clone "$TMPL_ID" "$VM_ID" --name "$VM_NAME" --full
+qm set   "$VM_ID" --ipconfig0 ip=dhcp
+qm set   "$VM_ID" --cicustom "user=local:snippets/ci-user-basic.yaml"
+qm cloudinit update "$VM_ID"
+qm start "$VM_ID"
+```
+
+Wait for the VM to boot and retrieve its IP via the QEMU guest agent:
+
+```bash
+qm agent "$VM_ID" network-get-interfaces \
+    | python3 -c "
+import sys, json
+ifaces = json.load(sys.stdin)
+for i in ifaces:
+    for a in i.get('ip-addresses', []):
+        if a['ip-address-type'] == 'ipv4' and not a['ip-address'].startswith('127.'):
+            print(a['ip-address'])
+"
+```
+
+Connect:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 cloudadmin@<IP>
+```
+
+---
+
+### Scenario 2 — DHCP + Password
+
+Generate a hashed password and paste it into `ci-user-password.yaml`:
+
+```bash
+openssl passwd -6 'MySecureP@ss!'
+# Copy the output ($6$...) into the passwd: field of ci-user-password.yaml
+```
+
+```bash
+TMPL_ID=9000
+VM_ID=101
+VM_NAME=my-server
+
+qm clone "$TMPL_ID" "$VM_ID" --name "$VM_NAME" --full
+qm set   "$VM_ID" --ipconfig0 ip=dhcp
+qm set   "$VM_ID" --cicustom "user=local:snippets/ci-user-password.yaml"
+qm cloudinit update "$VM_ID"
+qm start "$VM_ID"
+```
+
+Connect (use the plain-text password that matches the hash in the snippet):
+
+```bash
+ssh cloudadmin@<IP>
+```
+
+---
+
+### Scenario 3 — Static IP + SSH Key
+
+```bash
+TMPL_ID=9000
+VM_ID=102
+VM_NAME=my-server
+
+qm clone "$TMPL_ID" "$VM_ID" --name "$VM_NAME" --full
+qm set   "$VM_ID" \
+    --ipconfig0   ip=192.168.1.50/24,gw=192.168.1.1 \
+    --nameserver  "1.1.1.1 8.8.8.8" \
+    --searchdomain example.com
+qm set   "$VM_ID" --cicustom "user=local:snippets/ci-user-basic.yaml"
+qm cloudinit update "$VM_ID"
+qm start "$VM_ID"
+```
+
+Connect:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 cloudadmin@192.168.1.50
+```
+
+---
+
+### Scenario 4 — Static IP + Password
+
+Generate and set the password hash in `ci-user-password.yaml` (see Scenario 2),
+then:
+
+```bash
+TMPL_ID=9000
+VM_ID=103
+VM_NAME=my-server
+
+qm clone "$TMPL_ID" "$VM_ID" --name "$VM_NAME" --full
+qm set   "$VM_ID" \
+    --ipconfig0   ip=192.168.1.51/24,gw=192.168.1.1 \
+    --nameserver  "1.1.1.1 8.8.8.8" \
+    --searchdomain example.com
+qm set   "$VM_ID" --cicustom "user=local:snippets/ci-user-password.yaml"
+qm cloudinit update "$VM_ID"
+qm start "$VM_ID"
+```
+
+Connect:
+
+```bash
+ssh cloudadmin@192.168.1.51
+```
 
 ---
 

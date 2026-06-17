@@ -21,13 +21,16 @@ timezone: UTC
 # Create a non-root admin user with sudo access and SSH key authentication
 users:
   - default
-  - name: admin
-    gecos: Admin User
-    groups: [sudo, adm]
+  - name: cloudadmin
+    gecos: Cloud Administrator
+    # 'sudo'  grants sudo on Debian / Ubuntu
+    # 'wheel' grants sudo on Rocky / Oracle / openSUSE
+    # cloud-init silently ignores groups that do not exist on the target distro
+    groups: [sudo, wheel]
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ssh-ed25519 AAAA... user@workstation
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceThisWithYourActualPublicKeyContent user@workstation
 
 # Disable password authentication over SSH (key-only)
 ssh_pwauth: false
