@@ -54,6 +54,7 @@
 #      --only underlay|overlay   run only one layer (default: both)
 #      --check NAME[,NAME] run only named checks (see --list-checks)
 #      --explain CHECK     print what a check validates / why / fix, then exit
+#      --drop-window SEC   sample NIC drop deltas over SEC seconds (default 5)
 #      -a, --all           also show OK lines (default: hide OK, show WARN/FAIL)
 #      --json              emit machine-readable JSON (schema_version 1.0)
 #      --quiet             reserved for monitoring wrappers (suppress decoration)
@@ -79,7 +80,8 @@
 #  CONFIG  (override via env or /etc/pve-sdn-healthcheck.conf -- a sourced file).
 #    Everything auto-discovers; these are OPTIONAL overrides:
 #    SDN_NODES, SDN_SSH_OPTS, SDN_VTEPS, SDN_FW_MASTER, SDN_FW_BACKUP,
-#    SDN_L3VNIS, SDN_MTU_DELTA (default 50), SDN_VRF_PROBES.
+#    SDN_L3VNIS, SDN_MTU_DELTA (default 50), SDN_DROP_WINDOW (default 5),
+#    SDN_VRF_PROBES.
 #
 #  REQUIREMENTS
 #    Controller: bash, ssh.  Each node: vtysh (FRR), iproute2, sysctl.
@@ -90,7 +92,7 @@
 # NOTE: -e is intentionally NOT set: checks deliberately run commands that may
 # exit non-zero (that is how they detect faults).  pipefail keeps pipe status.
 set -o pipefail
-VERSION="1.0.1"
+VERSION="1.1.0"
 
 # ----------------------------- defaults / config -----------------------------
 # PORTABLE BY DEFAULT: every site-specific entity is AUTO-DISCOVERED at runtime
@@ -105,6 +107,7 @@ VERSION="1.0.1"
 : "${SDN_FW_BACKUP:=}"      # OPTIONAL: pin backup external peer -> down = WARN
 : "${SDN_L3VNIS:=}"         # "vrfvx_if:vrf:vni ..." (auto: 'show evpn vni')
 : "${SDN_MTU_DELTA:=50}"    # required underlay-over-overlay headroom (IPv4 VXLAN=50, v6=70)
+: "${SDN_DROP_WINDOW:=5}"   # seconds to sample NIC rx/tx_dropped deltas; one sleep for all NICs
 : "${SDN_VRF_PROBES:=}"     # OPTIONAL "vrf:probe_ip ..." for strict data-plane test
 [ -r /etc/pve-sdn-healthcheck.conf ] && . /etc/pve-sdn-healthcheck.conf
 
@@ -155,6 +158,7 @@ while [ $# -gt 0 ]; do
     --only) ONLY="$2"; shift ;;
     --check) ONLY_CHECKS="${2//,/ }"; shift ;;
     --explain) EXPLAIN="${2:-}"; shift ;;
+    --drop-window) SDN_DROP_WINDOW="${2:-}"; shift ;;
     --fix) FIX_MODE=1; [ -n "${2:-}" ] && case "$2" in -*) ;; *) FIX_CHECKS="${2//,/ }"; shift;; esac ;;
     --apply) FIX_MODE=2 ;;
     --yes|-y) FIX_YES=1 ;;
@@ -170,6 +174,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$SEL_NODES" ] && SDN_NODES="$SEL_NODES"
+case "$SDN_DROP_WINDOW" in
+  ''|*[!0-9]*) echo "invalid --drop-window/SDN_DROP_WINDOW: '$SDN_DROP_WINDOW' (use integer seconds)" >&2; exit 3 ;;
+esac
+[ "$SDN_DROP_WINDOW" -lt 1 ] && { echo "invalid --drop-window/SDN_DROP_WINDOW: '$SDN_DROP_WINDOW' (must be >= 1 second)" >&2; exit 3; }
 # --apply implies --fix; a bare --fix is preview-only.
 [ "$FIX_MODE" = 2 ] && : ; { [ "$FIX_MODE" -ge 1 ] && [ -z "$FIX_CHECKS" ]; } && FIX_CHECKS="$FIX_ALLOWLIST"
 
@@ -308,6 +316,7 @@ X
 ;;
     bgp_evpn) echo "bgp_evpn (UNDERLAY): internal EVPN fabric (node<->node VTEP, L2VPN-EVPN AF). Any peer not Established = FAIL. Advisory only.";;
     bgp_external) echo "bgp_external (UNDERLAY): per-VRF firewall/external peering, IPv4+IPv6 unicast. Master down/all-down = FAIL, redundant/backup or one-AF down = WARN. Advisory only.";;
+    iface_errors) echo "iface_errors (UNDERLAY): NIC hard errors + historical drops, plus active rx/tx_dropped delta sampled across all live NICs in one shared ${SDN_DROP_WINDOW}s window. Change with --drop-window SEC.";;
     mtu_local) echo "mtu_local (UNDERLAY): VXLAN transport MTU must be >= overlay MTU + ${SDN_MTU_DELTA} (IPv4) so encapsulated frames don't fragment. Advisory only.";;
     rib_fib) echo "rib_fib (OVERLAY): FRR routes 'selected' but not 'installed' in the kernel FIB = stuck/phantom zebra state. Advisory (restart zebra is a human decision).";;
     *) echo "No detailed explanation for '$1'. Run --list-checks for the catalogue.";;
@@ -418,18 +427,42 @@ chk_iface_link() {
 
 chk_iface_errors() {
   want_check iface_errors || return
+  local ifc active=""
+  # Sample all live NICs first, sleep once, then sample all again.  This keeps
+  # the delta KPI accurate in multi-NIC hosts without adding N seconds of delay
+  # for N interfaces.
+  declare -A rxe0 txe0 rxd0 txd0 rxd1 txd1
   for ifc in $PHYS_NICS; do
     ip link show "$ifc" 2>/dev/null | grep -q 'LOWER_UP' || continue
-    local rxe txe; rxe=$(cat /sys/class/net/$ifc/statistics/rx_errors 2>/dev/null||echo 0)
-    txe=$(cat /sys/class/net/$ifc/statistics/tx_errors 2>/dev/null||echo 0)
-    local rxd; rxd=$(cat /sys/class/net/$ifc/statistics/rx_dropped 2>/dev/null||echo 0)
+    active="$active $ifc"
+    rxe0[$ifc]=$(cat /sys/class/net/$ifc/statistics/rx_errors 2>/dev/null||echo 0)
+    txe0[$ifc]=$(cat /sys/class/net/$ifc/statistics/tx_errors 2>/dev/null||echo 0)
+    rxd0[$ifc]=$(cat /sys/class/net/$ifc/statistics/rx_dropped 2>/dev/null||echo 0)
+    txd0[$ifc]=$(cat /sys/class/net/$ifc/statistics/tx_dropped 2>/dev/null||echo 0)
+  done
+  [ -n "$active" ] && sleep "$SDN_DROP_WINDOW"
+  for ifc in $active; do
+    rxd1[$ifc]=$(cat /sys/class/net/$ifc/statistics/rx_dropped 2>/dev/null||echo "${rxd0[$ifc]}")
+    txd1[$ifc]=$(cat /sys/class/net/$ifc/statistics/tx_dropped 2>/dev/null||echo "${txd0[$ifc]}")
+  done
+  for ifc in $active; do
+    local rxe txe rxd txd drx dtx
+    rxe=${rxe0[$ifc]:-0}; txe=${txe0[$ifc]:-0}
+    rxd=${rxd1[$ifc]:-${rxd0[$ifc]:-0}}; txd=${txd1[$ifc]:-${txd0[$ifc]:-0}}
+    drx=$(( ${rxd1[$ifc]:-${rxd0[$ifc]:-0}} - ${rxd0[$ifc]:-0} ))
+    dtx=$(( ${txd1[$ifc]:-${txd0[$ifc]:-0}} - ${txd0[$ifc]:-0} ))
+    [ "$drx" -lt 0 ] && drx=0   # counter reset/wrap during sample
+    [ "$dtx" -lt 0 ] && dtx=0
     if [ "${rxe:-0}" -gt 10 ] || [ "${txe:-0}" -gt 10 ]; then
-      record FAIL UNDERLAY iface_errors "$ifc rx_err=$rxe tx_err=$txe (hard errors)" \
+      record FAIL UNDERLAY iface_errors "$ifc rx_err=$rxe tx_err=$txe drop_total rx=$rxd tx=$txd drop_delta/${SDN_DROP_WINDOW}s rx=$drx tx=$dtx (hard errors)" \
         "ethtool -S $ifc | grep -iE 'err|crc|fcs|fec' ; inspect cabling/optic/switchport"
+    elif [ "${drx:-0}" -gt 0 ] || [ "${dtx:-0}" -gt 0 ]; then
+      record WARN UNDERLAY iface_errors "$ifc actively dropping packets: drop_delta/${SDN_DROP_WINDOW}s rx=$drx tx=$dtx (total rx=$rxd tx=$txd)" \
+        "ethtool -S $ifc ; check congestion/ring/buffer/offloads and switch counters"
     elif [ "${rxd:-0}" -gt 1000 ]; then
-      record WARN UNDERLAY iface_errors "$ifc rx_dropped=$rxd (soft drops)" "ethtool -S $ifc ; check ring/buffer & offloads"
+      record WARN UNDERLAY iface_errors "$ifc historical rx_dropped=$rxd tx_dropped=$txd, but drop_delta/${SDN_DROP_WINDOW}s rx=0 tx=0" "ethtool -S $ifc ; check ring/buffer & offloads"
     else
-      record OK UNDERLAY iface_errors "$ifc clean (rx_err=$rxe tx_err=$txe drop=$rxd)"
+      record OK UNDERLAY iface_errors "$ifc clean (rx_err=$rxe tx_err=$txe drop_total rx=$rxd tx=$txd drop_delta/${SDN_DROP_WINDOW}s rx=$drx tx=$dtx)"
     fi
   done
 }
@@ -856,7 +889,7 @@ json_escape(){ local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/ }; s=
 
 run_node() { # collect records into REC[]; never render inline
   local node="$1" out rc
-  local envp="SDN_FW_MASTER='$SDN_FW_MASTER' SDN_FW_BACKUP='$SDN_FW_BACKUP' SDN_VRF_PROBES='$SDN_VRF_PROBES' SDN_MTU_DELTA='$SDN_MTU_DELTA'"
+  local envp="SDN_FW_MASTER='$SDN_FW_MASTER' SDN_FW_BACKUP='$SDN_FW_BACKUP' SDN_VRF_PROBES='$SDN_VRF_PROBES' SDN_MTU_DELTA='$SDN_MTU_DELTA' SDN_DROP_WINDOW='$SDN_DROP_WINDOW'"
   local rargs="--local"
   [ -n "$ONLY" ] && rargs="$rargs --only $ONLY"
   [ -n "$ONLY_CHECKS" ] && rargs="$rargs --check ${ONLY_CHECKS// /,}"

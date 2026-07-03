@@ -1,7 +1,7 @@
 .\" pve-sdn-healthcheck - Validate the SDN network layer of a Proxmox VE cluster
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-SDN\-HEALTHCHECK 8 "2026-07-03" "1.0.1" "Proxmox VE Tools"
+.TH PVE\-SDN\-HEALTHCHECK 8 "2026-07-03" "1.1.0" "Proxmox VE Tools"
 .SH NAME
 pve\-sdn\-healthcheck \- validate the underlay and overlay network of a Proxmox VE SDN cluster
 .SH SYNOPSIS
@@ -81,6 +81,17 @@ Run only the named checks (see
 .BR \-\-explain " " \fICHECK\fR
 Print what a check validates, why it matters, and how WARN/FAIL are decided,
 then exit.
+.TP
+.BR \-\-drop\-window " " \fISEC\fR
+Sample live NIC
+.BR rx_dropped / tx_dropped
+deltas over
+.I SEC
+seconds for the
+.B iface_errors
+check (default: 5).  All live NICs are sampled before one shared sleep and then
+sampled again, so multi\-NIC hosts get accurate per\-interface deltas without
+sleeping once per NIC.
 .TP
 .BR \-a ", " \-\-all
 Also show
@@ -234,6 +245,12 @@ tuples (default: discovered from
 .B SDN_MTU_DELTA
 Required underlay\-over\-overlay MTU headroom in bytes (default 50; use 70 for
 an IPv6 underlay).
+.TP
+.B SDN_DROP_WINDOW
+Seconds used for the live dropped\-packet delta KPI in
+.B iface_errors
+(default 5; equivalent to
+.BR \-\-drop\-window ).
 .TP
 .B SDN_VRF_PROBES
 Optional
