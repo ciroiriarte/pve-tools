@@ -1,3 +1,12 @@
+pve-tools (1.9.1-1) unstable; urgency=medium
+
+  * pve-sdn-healthcheck 1.0.1: fix mtu_local false positive when the
+    VXLAN carrier is a jumbo parent bridge (for example vmbr0) but route
+    lookup to a VTEP selects a 1500-byte host service VLAN subinterface
+    (for example vmbr0.$VLANTAG).
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 11:24:00 -0400
+
 pve-tools (1.9.0-1) unstable; urgency=medium
 
   * New tools:

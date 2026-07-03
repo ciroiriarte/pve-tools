@@ -90,7 +90,7 @@
 # NOTE: -e is intentionally NOT set: checks deliberately run commands that may
 # exit non-zero (that is how they detect faults).  pipefail keeps pipe status.
 set -o pipefail
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ----------------------------- defaults / config -----------------------------
 # PORTABLE BY DEFAULT: every site-specific entity is AUTO-DISCOVERED at runtime
@@ -509,24 +509,45 @@ chk_mtu() {
   # overlay MTU = max over VXLAN ifaces (tenant frame size)
   local max_o=0 m i
   for i in $VXLAN_IFS; do m=$(cat /sys/class/net/$i/mtu 2>/dev/null||echo 1500); [ "$m" -gt "$max_o" ] && max_o=$m; done
-  # underlay transport MTU = egress iface of the ROUTE to a remote VTEP (the
-  # real VXLAN-carrying path), NOT every iface that happens to hold a .203 IP
-  # (firewall-peering VLANs share that subnet but are not the VXLAN underlay).
-  local dev="" umtu=0 v
-  for v in $SDN_VTEPS $SDN_FW_MASTER; do
-    dev=$(ip -o route get "$v" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -1)
-    { [ -z "$dev" ] || [ "$dev" = lo ]; } && { dev=""; continue; }
-    echo " $VXLAN_IFS " | grep -q " $dev " && { dev=""; continue; }   # local VTEP, skip
-    umtu=$(cat /sys/class/net/$dev/mtu 2>/dev/null||echo 0); [ "${umtu:-0}" -gt 0 ] && break
+  # underlay transport MTU = the actual VXLAN parent/carrier device, when the
+  # kernel exposes one (`ip -d link ... vxlan ... dev vmbr0`).  Prefer this over
+  # `ip route get <peer>`: route lookup returns the L3 service/management
+  # interface for that destination, which can legitimately be a 1500-byte VLAN
+  # subinterface such as vmbr0.$VLANTAG while the VXLAN overlay is carried by
+  # the jumbo bridge vmbr0.  Only fall back to route lookup for VXLAN devices
+  # that do not have an explicit carrier device.
+  local underlay_devs="" dev="" umtu=0 v bad="" checked=0
+  for i in $VXLAN_IFS; do
+    dev=$(ip -d -o link show "$i" 2>/dev/null | awk '{for (n=1; n<=NF; n++) if ($n=="dev") {print $(n+1); exit}}' | sed 's/@.*//' | head -1)
+    { [ -z "$dev" ] || [ "$dev" = lo ]; } && continue
+    echo " $underlay_devs " | grep -q " $dev " || underlay_devs="$underlay_devs $dev"
   done
-  [ "${umtu:-0}" = 0 ] && { record WARN UNDERLAY mtu_local "could not determine underlay transport iface for VXLAN" "set the VTEP egress iface MTU manually and verify >= overlay+$SDN_MTU_DELTA"; return; }
-  data MTU_UNDERLAY "$umtu"; data MTU_OVERLAY "$max_o"
+  if [ -z "$underlay_devs" ]; then
+    # Fallback: egress iface of the ROUTE to a remote VTEP (the real
+    # VXLAN-carrying path), NOT every iface that happens to hold a .203 IP
+    # (firewall-peering VLANs share that subnet but are not the VXLAN underlay).
+    for v in $SDN_VTEPS $SDN_FW_MASTER; do
+      dev=$(ip -o route get "$v" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -1)
+      { [ -z "$dev" ] || [ "$dev" = lo ]; } && { dev=""; continue; }
+      echo " $VXLAN_IFS " | grep -q " $dev " && { dev=""; continue; }   # local VTEP, skip
+      underlay_devs="$dev"; break
+    done
+  fi
+  [ -z "$underlay_devs" ] && { record WARN UNDERLAY mtu_local "could not determine underlay transport iface for VXLAN" "set the VTEP carrier iface MTU manually and verify >= overlay+$SDN_MTU_DELTA"; return; }
+  for dev in $underlay_devs; do
+    umtu=$(cat /sys/class/net/$dev/mtu 2>/dev/null||echo 0)
+    [ "${umtu:-0}" -gt 0 ] || continue
+    checked=$((checked+1))
+    [ "$max_o" -gt 0 ] && [ "$umtu" -lt $((max_o + SDN_MTU_DELTA)) ] && bad="$bad $dev=$umtu"
+  done
+  [ "$checked" = 0 ] && { record WARN UNDERLAY mtu_local "could not read MTU for VXLAN carrier(s):$underlay_devs" "verify the VXLAN carrier iface MTU manually"; return; }
+  data MTU_UNDERLAY "$underlay_devs"; data MTU_OVERLAY "$max_o"
   if want_check mtu_local; then
-    if [ "$max_o" -gt 0 ] && [ "$umtu" -lt $((max_o + SDN_MTU_DELTA)) ]; then
-      record FAIL UNDERLAY mtu_local "underlay transport $dev MTU $umtu < overlay $max_o + $SDN_MTU_DELTA -> VXLAN frames fragment/drop" \
-        "Raise $dev (and the switch port) to jumbo >= $((max_o + SDN_MTU_DELTA))"
+    if [ -n "$bad" ]; then
+      record FAIL UNDERLAY mtu_local "underlay transport MTU too small:$bad < overlay $max_o + $SDN_MTU_DELTA -> VXLAN frames fragment/drop" \
+        "Raise the VXLAN carrier(s) and switch port(s) to jumbo >= $((max_o + SDN_MTU_DELTA))"
     else
-      record OK UNDERLAY mtu_local "MTU headroom OK (underlay $dev=$umtu >= overlay $max_o + $SDN_MTU_DELTA)"
+      record OK UNDERLAY mtu_local "MTU headroom OK (underlay carrier(s):$underlay_devs >= overlay $max_o + $SDN_MTU_DELTA)"
     fi
   fi
 }
