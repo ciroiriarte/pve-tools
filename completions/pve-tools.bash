@@ -125,7 +125,7 @@ _pve_sdn_healthcheck() {
     local cur prev opts
     _init_completion || return
 
-    opts="--node --only --check --explain --drop-window -a --all --json --no-color
+    opts="--node --only --check --explain --drop-window --parallel -a --all --json --no-color
           --list-checks --fix --apply -y --yes -h --help -v --version"
 
     case "$prev" in

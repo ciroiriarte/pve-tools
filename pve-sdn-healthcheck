@@ -55,6 +55,7 @@
 #      --check NAME[,NAME] run only named checks (see --list-checks)
 #      --explain CHECK     print what a check validates / why / fix, then exit
 #      --drop-window SEC   sample NIC drop deltas over SEC seconds (default 5)
+#      --parallel N        scan up to N nodes concurrently (default 16; 1 = serial)
 #      -a, --all           also show OK lines (default: hide OK, show WARN/FAIL)
 #      --json              emit machine-readable JSON (schema_version 1.0)
 #      --quiet             reserved for monitoring wrappers (suppress decoration)
@@ -81,7 +82,7 @@
 #    Everything auto-discovers; these are OPTIONAL overrides:
 #    SDN_NODES, SDN_SSH_OPTS, SDN_VTEPS, SDN_FW_MASTER, SDN_FW_BACKUP,
 #    SDN_L3VNIS, SDN_MTU_DELTA (default 50), SDN_DROP_WINDOW (default 5),
-#    SDN_VRF_PROBES.
+#    SDN_PARALLEL (default 16), SDN_VRF_PROBES.
 #
 #  REQUIREMENTS
 #    Controller: bash, ssh.  Each node: vtysh (FRR), iproute2, sysctl.
@@ -92,7 +93,7 @@
 # NOTE: -e is intentionally NOT set: checks deliberately run commands that may
 # exit non-zero (that is how they detect faults).  pipefail keeps pipe status.
 set -o pipefail
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ----------------------------- defaults / config -----------------------------
 # PORTABLE BY DEFAULT: every site-specific entity is AUTO-DISCOVERED at runtime
@@ -108,6 +109,7 @@ VERSION="1.1.0"
 : "${SDN_L3VNIS:=}"         # "vrfvx_if:vrf:vni ..." (auto: 'show evpn vni')
 : "${SDN_MTU_DELTA:=50}"    # required underlay-over-overlay headroom (IPv4 VXLAN=50, v6=70)
 : "${SDN_DROP_WINDOW:=5}"   # seconds to sample NIC rx/tx_dropped deltas; one sleep for all NICs
+: "${SDN_PARALLEL:=16}"     # max nodes scanned concurrently; keeps wall-time ~flat as the cluster grows
 : "${SDN_VRF_PROBES:=}"     # OPTIONAL "vrf:probe_ip ..." for strict data-plane test
 [ -r /etc/pve-sdn-healthcheck.conf ] && . /etc/pve-sdn-healthcheck.conf
 
@@ -159,6 +161,7 @@ while [ $# -gt 0 ]; do
     --check) ONLY_CHECKS="${2//,/ }"; shift ;;
     --explain) EXPLAIN="${2:-}"; shift ;;
     --drop-window) SDN_DROP_WINDOW="${2:-}"; shift ;;
+    --parallel) SDN_PARALLEL="${2:-}"; shift ;;
     --fix) FIX_MODE=1; [ -n "${2:-}" ] && case "$2" in -*) ;; *) FIX_CHECKS="${2//,/ }"; shift;; esac ;;
     --apply) FIX_MODE=2 ;;
     --yes|-y) FIX_YES=1 ;;
@@ -178,6 +181,10 @@ case "$SDN_DROP_WINDOW" in
   ''|*[!0-9]*) echo "invalid --drop-window/SDN_DROP_WINDOW: '$SDN_DROP_WINDOW' (use integer seconds)" >&2; exit 3 ;;
 esac
 [ "$SDN_DROP_WINDOW" -lt 1 ] && { echo "invalid --drop-window/SDN_DROP_WINDOW: '$SDN_DROP_WINDOW' (must be >= 1 second)" >&2; exit 3; }
+case "$SDN_PARALLEL" in
+  ''|*[!0-9]*) echo "invalid --parallel/SDN_PARALLEL: '$SDN_PARALLEL' (use integer >= 1)" >&2; exit 3 ;;
+esac
+[ "$SDN_PARALLEL" -lt 1 ] && { echo "invalid --parallel/SDN_PARALLEL: '$SDN_PARALLEL' (must be >= 1)" >&2; exit 3; }
 # --apply implies --fix; a bare --fix is preview-only.
 [ "$FIX_MODE" = 2 ] && : ; { [ "$FIX_MODE" -ge 1 ] && [ -z "$FIX_CHECKS" ]; } && FIX_CHECKS="$FIX_ALLOWLIST"
 
@@ -887,17 +894,26 @@ sev_color() { case "$1" in OK) printf '%s' "$GRN";; WARN) printf '%s' "$YLW";; F
 cell()      { local w; w=$(sev_word "$1"); printf "%s[%-5s]%s" "$(sev_color "$w")" "$w" "$NC"; }
 json_escape(){ local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/ }; s=${s//$'\n'/ }; printf '%s' "$s"; }
 
-run_node() { # collect records into REC[]; never render inline
-  local node="$1" out rc
+fetch_node() { # $1=node $2=outfile : BACKGROUND-safe -- only does the SSH, writes
+  # raw records to "$2" and the ssh exit code to "$2.rc".  Touches no shared state
+  # so many copies can run concurrently; ingest_node() aggregates them serially.
+  local node="$1" file="$2" out rc
   local envp="SDN_FW_MASTER='$SDN_FW_MASTER' SDN_FW_BACKUP='$SDN_FW_BACKUP' SDN_VRF_PROBES='$SDN_VRF_PROBES' SDN_MTU_DELTA='$SDN_MTU_DELTA' SDN_DROP_WINDOW='$SDN_DROP_WINDOW'"
   local rargs="--local"
   [ -n "$ONLY" ] && rargs="$rargs --only $ONLY"
   [ -n "$ONLY_CHECKS" ] && rargs="$rargs --check ${ONLY_CHECKS// /,}"
   [ "$FIX_MODE" = 1 ] && rargs="$rargs --fix ${FIX_CHECKS// /,}"
   [ "$FIX_MODE" = 2 ] && rargs="$rargs --fix ${FIX_CHECKS// /,} --apply --yes"
-  [ "$JSON" = 0 ] && [ -t 2 ] && printf '%s  scanning %s ...%s\r' "$BLU" "$node" "$NC" >&2
   out=$(ssh $SSH_BASE_OPTS $SDN_SSH_OPTS "$node" "$envp bash -s -- $rargs" < "$0" 2>/dev/null)
   rc=$?
+  printf '%s' "$out" > "$file"
+  printf '%s' "$rc" > "$file.rc"
+}
+
+ingest_node() { # $1=node $2=outfile : SERIAL -- fold fetch_node()'s output into REC[]
+  local node="$1" file="$2" out rc
+  out=$(cat "$file" 2>/dev/null)
+  rc=$(cat "$file.rc" 2>/dev/null); rc=${rc:-255}
   local short; short=$(echo "$node" | sed 's/^[^@]*@//')
   if [ $rc -ge 250 ] || { [ $rc -ne 0 ] && [ -z "$out" ]; }; then
     UNREACH=1; NODE_WORST[$short]=UNREACH; N_FAIL=$((N_FAIL+1))
@@ -991,7 +1007,32 @@ emit_json() {
 }
 
 main_controller() {
-  local n; for n in $SDN_NODES; do run_node "$n"; done
+  # Two phases so the per-node drop-window sleep runs concurrently instead of
+  # stacking N x SDN_DROP_WINDOW: (1) fan out the SSH fetches up to SDN_PARALLEL
+  # at a time, (2) ingest the buffered output serially in node order (aggregation
+  # mutates shared arrays, so it must stay single-threaded).
+  local n idx=0 tmpd
+  local -a NODES_ORD=() FILES_ORD=()
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/pve-sdn-hc.XXXXXX") || { echo "cannot create temp dir" >&2; exit 3; }
+  [ "$JSON" = 0 ] && [ -t 2 ] && printf '%s  scanning %s node(s), up to %s in parallel ...%s\r' \
+    "$BLU" "$(set -- $SDN_NODES; echo $#)" "$SDN_PARALLEL" "$NC" >&2
+  for n in $SDN_NODES; do
+    NODES_ORD[$idx]="$n"; FILES_ORD[$idx]="$tmpd/n$idx"
+    fetch_node "$n" "$tmpd/n$idx" &
+    idx=$((idx+1))
+    # Throttle on the live job count so this stays correct on any bash: reap one
+    # finisher when at the cap (wait -n), or drain the batch on bash<4.3.
+    while [ "$(jobs -rp | wc -l)" -ge "$SDN_PARALLEL" ]; do
+      wait -n 2>/dev/null || { wait; break; }
+    done
+  done
+  wait
+  local i=0
+  while [ "$i" -lt "$idx" ]; do
+    ingest_node "${NODES_ORD[$i]}" "${FILES_ORD[$i]}"
+    i=$((i+1))
+  done
+  rm -rf "$tmpd"
   [ "$JSON" = 0 ] && [ -t 2 ] && printf '%-70s\r' "" >&2
   # An unreachable node means we cannot confirm cluster health -> UNKNOWN (3),
   # unless a reachable node already produced a hard FAIL (2 is more actionable).

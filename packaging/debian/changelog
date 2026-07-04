@@ -1,3 +1,13 @@
+pve-tools (1.11.0-1) unstable; urgency=medium
+
+  * pve-sdn-healthcheck 1.2.0: add --parallel / SDN_PARALLEL (default 16) to
+    scan nodes concurrently with a bounded worker pool. The per-node
+    iface_errors drop-window sleep previously stacked serially (N nodes x
+    SDN_DROP_WINDOW); fanning out keeps cluster-wide wall-time roughly flat
+    as node count grows. Output is still buffered and reported in node order.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 12:05:00 -0400
+
 pve-tools (1.10.0-1) unstable; urgency=medium
 
   * pve-sdn-healthcheck 1.1.0: add --drop-window / SDN_DROP_WINDOW and

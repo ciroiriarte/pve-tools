@@ -93,6 +93,19 @@ check (default: 5).  All live NICs are sampled before one shared sleep and then
 sampled again, so multi\-NIC hosts get accurate per\-interface deltas without
 sleeping once per NIC.
 .TP
+.BR \-\-parallel " " \fIN\fR
+Scan up to
+.I N
+nodes concurrently (default: 16; use
+.B 1
+for the old serial behaviour).  Because each node's
+.B iface_errors
+check sleeps for
+.BR \-\-drop\-window
+seconds, serial scanning would cost that window once per node; fanning out keeps
+the cluster\-wide wall\-time roughly flat as node count grows.  Results are still
+buffered and reported in node order.
+.TP
 .BR \-a ", " \-\-all
 Also show
 .B OK
@@ -251,6 +264,10 @@ Seconds used for the live dropped\-packet delta KPI in
 .B iface_errors
 (default 5; equivalent to
 .BR \-\-drop\-window ).
+.TP
+.B SDN_PARALLEL
+Maximum number of nodes scanned concurrently (default 16; equivalent to
+.BR \-\-parallel ).
 .TP
 .B SDN_VRF_PROBES
 Optional
