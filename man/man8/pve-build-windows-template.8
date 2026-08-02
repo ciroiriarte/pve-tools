@@ -1,0 +1,489 @@
+.\" pve-build-windows-template - Build sysprepped Windows Server templates on Proxmox VE
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-02" "1.0.0" "Proxmox VE Tools"
+
+.SH NAME
+pve\-build\-windows\-template \- build sysprepped, cloud\-init\-capable Windows Server templates on Proxmox VE
+
+.SH SYNOPSIS
+.B pve\-build\-windows\-template
+.RB { \-\-iso
+.IR PATH " | " \-\-eval
+.IR RELEASE }
+.RB [ \-\-edition
+.IR core | desktop | both ]
+.RB [ \-\-sku
+.IR standard | datacenter ]
+.RB [ \-\-storage
+.IR NAME ]
+.RI [ OPTIONS ]
+
+.SH DESCRIPTION
+.B pve\-build\-windows\-template
+turns a Windows Server installation ISO into one or more sysprepped Proxmox VE
+templates in a single non\-interactive run. No console interaction is required
+at any point: the script generates an
+.B Autounattend.xml
+answer file, bakes it together with the virtio drivers and every in\-guest
+payload onto a small generated ISO, drives a build VM to completion, and seals
+the result with
+.BR "qm template" .
+.PP
+By default it produces
+.B two
+templates per invocation \(em Server Core and Desktop Experience \(em at
+consecutive VMIDs starting at
+.BR \-\-start\-id .
+.PP
+The output is a genuine template rather than a golden disk: Cloudbase\-Init is
+installed and configured against the PVE cloud\-init drive, so a clone receives
+its hostname, network configuration, administrator password and SSH keys on
+first boot, exactly as a Linux clone does.
+
+.SS Licensing
+The script
+.B never
+downloads, caches or redistributes Windows media or a licence key. The operator
+supplies the ISO with
+.BR \-\-iso .
+The single exception is opt\-in: passing
+.B \-\-eval
+downloads Microsoft's freely\-redistributable 180\-day evaluation media from the
+Microsoft Evaluation Center. Only the virtio\-win driver ISO, spice\-guest\-tools
+and Cloudbase\-Init \(em all redistributable \(em are fetched automatically, and
+each can be overridden for air\-gapped sites.
+.PP
+Product keys are never downloaded and never appear in
+.BR \-\-dry\-run
+output, diagnostics or, in remote mode, the remote process table.
+
+.SS Modes of operation
+.TP
+.B LOCAL
+Run directly on a PVE node, as root.
+.TP
+.B REMOTE
+Run from a jump host and give the node with
+.BR \-S .
+The script copies itself to the node and re\-executes there. The template stays
+on the node \(em nothing is downloaded back. All paths
+.RB ( \-\-iso ", " \-\-cache\-dir )
+are interpreted
+.BR remotely .
+Only
+.BR ssh (1)
+and
+.BR scp (1)
+are needed on the jump host.
+
+.SS Build sequence
+.IP 1. 4
+Resolve the Windows media, the virtio\-win ISO, the Cloudbase\-Init MSI and
+spice\-guest\-tools, caching each under the ISO storage.
+.IP 2. 4
+Mount the Windows media (UDF) and read the image list with
+.BR wiminfo (1)
+to auto\-detect the release, detect evaluation media, and resolve the exact
+.I /IMAGE/NAME
+for the requested SKU and edition.
+.IP 3. 4
+Flatten the release\-specific virtio drivers and stage every in\-guest payload
+onto a generated answer ISO. The build VM therefore needs
+.B no
+network access.
+.IP 4. 4
+Create the build VM \(em
+.BR ovmf ", " q35 ", " virtio\-scsi\-single ,
+a TPM 2.0 state volume and pre\-enrolled Secure Boot keys \(em and start it.
+.IP 5. 4
+Wait for Windows Setup, then for the in\-guest payload installation reported
+through the QEMU guest agent, then for sysprep's own shutdown.
+.IP 6. 4
+Verify offline that
+.I Sysprep_succeeded.tag
+exists on the disk, detach every CD\-ROM, attach the cloud\-init drive and run
+.BR "qm template" .
+
+.SH OPTIONS
+
+.SS Media
+.TP
+.BI \-i " PATH" "\fR, \fP" \-\-iso " PATH"
+Windows installation ISO, given either as a filesystem path or as a
+.IR STORAGE :iso/ NAME
+volume identifier. Never downloaded automatically.
+.TP
+.BI \-\-eval " RELEASE"
+Download the Microsoft 180\-day evaluation ISO for
+.IR RELEASE " (" 2019 " | " 2022 " | " 2025 ).
+Ignored when
+.B \-\-iso
+is given.
+.TP
+.BI \-R " REL" "\fR, \fP" \-\-release " REL"
+.IR 2019 " | " 2022 " | " 2025 .
+Auto\-detected from the media when omitted.
+.TP
+.BI \-\-virtio\-iso " PATH"
+Use this virtio\-win ISO instead of downloading the stable build.
+.TP
+.BI \-\-cloudbase\-msi " PATH"
+Use this Cloudbase\-Init MSI instead of downloading it.
+.TP
+.BI \-\-spice\-exe " PATH"
+Use this spice\-guest\-tools installer instead of downloading it.
+
+.SS What to build
+.TP
+.BI \-e " WHICH" "\fR, \fP" \-\-edition " WHICH"
+.IR core " | " desktop " | " both .
+Default:
+.BR both .
+.TP
+.BI \-k " SKU" "\fR, \fP" \-\-sku " SKU"
+.IR standard " | " datacenter .
+Default:
+.BR standard .
+.TP
+.BI \-I " ID" "\fR, \fP" \-\-start\-id " ID"
+First VMID. One VMID is consumed per edition, consecutively. Default:
+.BR 9020 .
+.TP
+.B \-\-force
+Destroy an existing VMID instead of skipping it.
+
+.SS Placement and sizing
+.TP
+.BI \-s " NAME" "\fR, \fP" \-\-storage " NAME"
+Storage for VM disks. Default:
+.BR local\-lvm .
+.TP
+.BI \-\-iso\-storage " NAME"
+Storage for downloaded and generated ISOs. Must accept
+.B iso
+content. Default:
+.BR \-\-storage .
+.TP
+.BI \-B " NAME" "\fR, \fP" \-\-bridge " NAME"
+Bridge for the finished template's NIC. Default:
+.BR vmbr0 .
+.TP
+.BI \-\-vlan " TAG"
+VLAN tag for the template NIC.
+.TP
+.BI \-\-build\-bridge " NAME"
+Bridge for the build VM. Defaults to
+.BR \-\-bridge .
+An uplink\-less bridge is recommended so Windows Update cannot interfere with
+the build.
+.TP
+.BI \-D " GB" "\fR, \fP" \-\-disk\-size " GB"
+OS disk size. Default:
+.BR 60 .
+.TP
+.BI \-c " TYPE" "\fR, \fP" \-\-cpu\-type " TYPE"
+CPU model. Default:
+.BR x86\-64\-v2\-AES ,
+which is migration\-safe and sufficient for Server 2025 (POPCNT + SSE4.2).
+.BR host " and " max
+are deliberately not the default \(em they break live migration.
+.TP
+.BI \-\-cores " N" "\fR, \fP" \-\-memory " MB"
+Template sizing. Defaults:
+.BR 2 " and " 4096 .
+.TP
+.BI \-\-build\-cores " N" "\fR, \fP" \-\-build\-memory " MB"
+Build VM sizing. Defaults:
+.BR 4 " and " 8192 .
+.TP
+.BI \-\-vga " TYPE"
+.IR std " | " qxl " | " virtio .
+Default:
+.BR std .
+See
+.B LIMITATIONS
+regarding SPICE.
+.TP
+.B \-\-no\-tpm
+Do not attach a TPM 2.0 state volume.
+.TP
+.B \-\-no\-secureboot
+Do not pre\-enrol the Microsoft Secure Boot keys.
+
+.SS Windows configuration
+.TP
+.BI \-\-locale " TAG"
+System and UI locale. Default:
+.BR en\-US .
+.TP
+.BI \-\-input\-locale " TAG"
+Keyboard layout. Defaults to
+.BR \-\-locale .
+.TP
+.BI \-\-timezone " TZ"
+Windows time zone name. Default:
+.BR UTC ,
+matched by
+.B \-\-localtime 0
+on the VM so the RTC and the guest clock agree.
+.TP
+.BI \-\-admin\-password " PW" "\fR, \fP" \-\-admin\-password\-file " FILE"
+Administrator password. When neither is given a random 18\-character password
+is generated and printed once.
+.TP
+.BI \-\-ci\-username " NAME"
+The account Cloudbase\-Init manages on clones. Default:
+.BR Administrator .
+
+.SS Activation
+Supplying no key at all is valid \(em the install then runs in evaluation or
+deferred\-activation mode and the operator activates after deployment.
+.TP
+.BI \-\-product\-key " KEY" "\fR, \fP" \-\-product\-key\-file " FILE"
+Operator\-supplied key, embedded in the answer file and masked in all output.
+.TP
+.B \-\-kms
+Use the public Microsoft KMS client setup key (GVLK) for this release and SKU.
+Rejected on evaluation media, where a GVLK cannot activate.
+
+.SS Caching, timeouts and diagnostics
+.TP
+.BI \-\-cache\-dir " DIR"
+Payload cache. Default:
+.IR <iso\-storage> /pve\-tools\-cache/windows\-templates .
+.TP
+.B \-\-refresh\-cache
+Re\-download cached media.
+.TP
+.B \-\-keep\-answer\-iso
+Keep the generated answer ISO. It contains the administrator password and any
+product key in cleartext, so it is deleted by default.
+.TP
+.B \-\-keep\-on\-failure
+Leave the build VM in place when a build fails, for interactive inspection.
+.TP
+.BI \-\-install\-timeout " S" "\fR, \fP" \-\-payload\-timeout " S" "\fR, \fP" \-\-sysprep\-timeout " S"
+Per\-phase timeouts in seconds. Defaults:
+.BR 3600 ", " 1800 ", " 1800 .
+.TP
+.B \-\-show\-answer\-file
+Print the generated
+.B Autounattend.xml
+with secrets redacted.
+
+.SS General
+.TP
+.BI \-m " MODE" "\fR, \fP" \-\-mode " MODE"
+.IR local " | " remote .
+Defaults to
+.B local
+unless
+.B \-S
+is given.
+.TP
+.BI \-S " USER@HOST" "\fR, \fP" \-\-server " USER@HOST"
+Remote mode \(em target PVE node.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print the full plan and touch nothing.
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.TP
+.BR \-v ", " \-\-version
+Print the script version.
+
+.SH CLOUD-INIT ON WINDOWS
+Proxmox VE presents cloud\-init to Windows guests as an OpenStack config\-drive
+.RB ( citype " " configdrive2 ,
+the default for any Windows
+.BR ostype ).
+The generated Cloudbase\-Init configuration uses
+.B ConfigDriveService
+accordingly. Three behaviours differ from a Linux template and are worth
+knowing before you clone:
+.TP
+.B \-\-ciuser is a no\-op
+Cloudbase\-Init acts on the account named in its own configuration file, not on
+anything from the metadata. The managed account is fixed at build time by
+.BR \-\-ci\-username " (default " Administrator ).
+.TP
+.B \-\-cipassword works
+It reaches the guest as
+.I admin_pass
+in
+.I meta_data.json
+and is applied to the managed account. Note that
+.B qm cloudinit dump <id> meta
+does not show it: that subcommand renders the generic config\-drive metadata
+rather than the Cloudbase\-Init variant PVE actually generates for Windows
+guests.
+.B \-\-sshkeys
+works the same way and lands in
+.IR C:\e\eUsers\e\e<ci\-username>\e\e.ssh\e\eauthorized_keys ,
+but Windows Server ships no SSH server, so the keys are inert until the
+OpenSSH Server feature is installed.
+.TP
+.B Hostname arrives through user_data, not meta_data
+PVE's Windows
+.I meta_data.json
+carries no
+.I hostname
+key, so
+.B UserDataPlugin
+is mandatory in the plugin list \(em it is what feeds the cloud\-config
+.I hostname
+through to
+.BR SetHostNamePlugin .
+Removing it from
+.I cloudbase\-init.conf
+silently breaks
+.BR "qm clone \-\-name" .
+
+.SH EXAMPLES
+.PP
+Build Core and Desktop Standard templates from an operator\-supplied ISO:
+.PP
+.RS 4
+.EX
+pve\-build\-windows\-template \-\-iso dstore01:iso/win2022.iso \-\-storage dstore01
+.EE
+.RE
+.PP
+Evaluation media, Datacenter, Core only, built on an isolated bridge:
+.PP
+.RS 4
+.EX
+pve\-build\-windows\-template \-\-eval 2025 \-\-sku datacenter \-\-edition core \\
+    \-\-storage dstore01 \-\-build\-bridge vmbr1 \-\-start\-id 9040
+.EE
+.RE
+.PP
+Licensed media activated against a KMS server:
+.PP
+.RS 4
+.EX
+pve\-build\-windows\-template \-\-iso /mnt/iso/win2022\-vl.iso \-\-kms \\
+    \-\-storage dstore01
+.EE
+.RE
+.PP
+Remote build from a jump host (paths are interpreted on the node):
+.PP
+.RS 4
+.EX
+pve\-build\-windows\-template \-\-iso dstore01:iso/win2022.iso \\
+    \-\-storage dstore01 \-S root@pve1.example.com
+.EE
+.RE
+.PP
+Clone the resulting template:
+.PP
+.RS 4
+.EX
+qm clone 9020 130 \-\-name winsrv01 \-\-full
+qm set 130 \-\-ipconfig0 ip=10.0.0.30/24,gw=10.0.0.1 \-\-nameserver 10.0.0.1
+qm set 130 \-\-cipassword 'secret' \-\-sshkeys ~/.ssh/id_ed25519.pub
+qm start 130
+.EE
+.RE
+
+.SH FILES
+.TP
+.IR <iso\-storage> /template/iso/
+Downloaded evaluation and virtio\-win ISOs, and the generated
+.I pve\-answer\-*.iso
+(removed after each build unless
+.BR \-\-keep\-answer\-iso ).
+.TP
+.IR <iso\-storage> /pve\-tools\-cache/windows\-templates/
+Cloudbase\-Init and spice\-guest\-tools installers. Override with
+.BR \-\-cache\-dir .
+.TP
+.I C:\e\epvebuild\e\estate.txt
+In\-guest build progress log, preserved on the finished template for
+post\-mortem analysis.
+
+.SH EXIT STATUS
+.TP
+.B 0
+All requested templates were built and verified.
+.TP
+.B 1
+A validation, download, build or verification step failed. The build VM is
+destroyed unless
+.B \-\-keep\-on\-failure
+was given; diagnostics from
+.IR state.txt ,
+.I Panther\e\esetupact.log
+and the sysprep log are printed first.
+
+.SH DEPENDENCIES
+On the PVE node: Proxmox VE 8.x or later,
+.BR genisoimage (1)
+or
+.BR mkisofs (1),
+.BR wiminfo (1)
+from
+.IR wimtools ,
+.BR guestfish (1)
+from
+.IR libguestfs\-tools ,
+.BR curl (1)
+and
+.BR python3 (1).
+In remote mode the jump host needs only
+.BR ssh (1)
+and
+.BR scp (1).
+
+.SH LIMITATIONS
+.IP \(bu 2
+Windows Server only \(em desktop Windows editions are not supported.
+.IP \(bu 2
+UEFI/GPT only. BIOS/MBR installs are not supported.
+.IP \(bu 2
+Domain join at build time is out of scope; it belongs at clone time.
+.IP \(bu 2
+Single NIC only. PVE's Windows config\-drive writes the network configuration
+as Debian ENI with no MAC address, so the interface mapping is ambiguous with
+more than one NIC.
+.IP \(bu 2
+Cloudbase\-Init is always installed; there is no
+.B \-\-no\-cloudbase\-init
+escape hatch in this release.
+.IP \(bu 2
+The virtio\-win
+.B qxldod
+display driver has no INF for Server 2022 or 2025, so
+.B \-\-vga std
+is the default. spice\-guest\-tools (and therefore the vdagent service) is
+installed regardless \(em the display type is a clone\-time decision made with
+.BR "qm set <id> \-\-vga qxl" .
+.IP \(bu 2
+The virtio\-win ISO must be new enough for the target release. The script
+refuses to build rather than producing a broken template.
+
+.SH SEE ALSO
+.BR pve\-import\-cloud\-images (8),
+.BR pve\-create\-tshoot\-image (8),
+.BR pve\-vmnic\-fix (8),
+.BR qm (1),
+.BR wiminfo (1),
+.BR genisoimage (1)
+.PP
+Proxmox VE Windows guest best practices:
+.UR https://pve.proxmox.com/wiki/Windows_2025_guest_best_practices
+.UE
+.PP
+Cloudbase\-Init documentation:
+.UR https://cloudbase-init.readthedocs.io/
+.UE
+
+.SH AUTHORS
+Ciro Iriarte
+.RI < ciro.iriarte+software@gmail.com >
+
+.SH LICENSE
+MIT

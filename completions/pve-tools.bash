@@ -208,3 +208,63 @@ _pve_ceph_upgrade() {
 }
 
 complete -F _pve_ceph_upgrade pve-ceph-upgrade
+
+# --- pve-build-windows-template -----------------------------------------------
+
+_pve_build_windows_template() {
+    local cur prev opts
+    _init_completion || return
+
+    opts="-i --iso --eval -R --release --virtio-iso --cloudbase-msi --spice-exe
+          -e --edition -k --sku -I --start-id --force
+          -s --storage --iso-storage -B --bridge --vlan --build-bridge
+          -D --disk-size -c --cpu-type --cores --memory
+          --build-cores --build-memory --vga --no-tpm --no-secureboot
+          --locale --input-locale --timezone
+          --admin-password --admin-password-file --ci-username
+          --product-key --product-key-file --kms
+          --cache-dir --refresh-cache --keep-answer-iso --keep-on-failure
+          --install-timeout --payload-timeout --sysprep-timeout
+          -m --mode -S --server --show-answer-file
+          -n --dry-run -h --help -v --version"
+
+    case "$prev" in
+        -e|--edition)
+            COMPREPLY=( $(compgen -W "core desktop both" -- "$cur") ); return ;;
+        -k|--sku)
+            COMPREPLY=( $(compgen -W "standard datacenter" -- "$cur") ); return ;;
+        --eval|-R|--release)
+            COMPREPLY=( $(compgen -W "2019 2022 2025" -- "$cur") ); return ;;
+        -m|--mode)
+            COMPREPLY=( $(compgen -W "local remote" -- "$cur") ); return ;;
+        --vga)
+            COMPREPLY=( $(compgen -W "std qxl virtio" -- "$cur") ); return ;;
+        -i|--iso|--virtio-iso)
+            _filedir iso; return ;;
+        --cloudbase-msi)
+            _filedir msi; return ;;
+        --spice-exe)
+            _filedir exe; return ;;
+        --admin-password-file|--product-key-file)
+            _filedir; return ;;
+        --cache-dir)
+            _filedir -d; return ;;
+        -s|--storage|--iso-storage|-B|--bridge|--vlan|--build-bridge|-I|--start-id)
+            # Expects a value; no useful default completions
+            return ;;
+        -D|--disk-size|-c|--cpu-type|--cores|--memory|--build-cores|--build-memory)
+            return ;;
+        --locale|--input-locale|--timezone|--admin-password|--ci-username)
+            return ;;
+        --product-key|-S|--server)
+            return ;;
+        --install-timeout|--payload-timeout|--sysprep-timeout)
+            return ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+
+complete -F _pve_build_windows_template pve-build-windows-template

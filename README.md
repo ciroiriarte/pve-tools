@@ -8,6 +8,7 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
   - [Cloud-init usage](cloud-init-usage.md) - Provisioning examples and sample snippets
 - [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
 - [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
+- [pve-build-windows-template](#pve-build-windows-template) - Build sysprepped Windows Server templates unattended
 - [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
 - [pve-rolling-upgrade](#pve-rolling-upgrade) - Rolling, health-gated PVE 8→9 upgrade of one node
 - [pve-ceph-upgrade](#pve-ceph-upgrade) - Online Ceph major-release migration (e.g. Squid→Tentacle)
@@ -288,6 +289,130 @@ All VM interaction uses the QEMU guest agent (virtio serial channel) — no netw
 
 ---
 
+## pve-build-windows-template
+
+Turn a Windows Server ISO into sysprepped, cloud-init-capable PVE templates in one non-interactive run. No console interaction at any point — no clicking through Setup, no hunting for the virtio driver at disk selection, no manual sysprep.
+
+By default a single invocation produces **two** templates — Server Core and Desktop Experience — at consecutive VMIDs.
+
+The output is a genuine template rather than a golden disk: [Cloudbase-Init](https://cloudbase.it/cloudbase-init/) is installed and configured against the PVE cloud-init drive, so a clone picks up its hostname, network configuration, administrator password and SSH keys on first boot, exactly as a Linux clone does.
+
+**Modes of operation:**
+
+| Mode | Where to run | Where the template lands | Requirements |
+|---|---|---|---|
+| **Local** | Directly on a PVE node (as root) | That node | PVE tools + genisoimage + wimtools + libguestfs |
+| **Remote** | From a jump host (`-S user@host`) | The remote node | `ssh` + `scp` only |
+
+In remote mode the script copies itself to the node and re-executes there. Nothing is downloaded back — the template stays on the node — and all paths (`--iso`, `--cache-dir`) are interpreted **remotely**. Secrets travel as mode-0600 files, never as arguments, so they never appear in the remote process table.
+
+### Licensing
+
+The script **never** downloads, caches or redistributes Windows media or a licence key. You supply the ISO with `--iso`. The single exception is opt-in: `--eval 2019|2022|2025` downloads Microsoft's freely-redistributable 180-day evaluation media from the Microsoft Evaluation Center.
+
+Only the redistributable payloads — the virtio-win driver ISO, spice-guest-tools and Cloudbase-Init — are fetched automatically, and each can be overridden with `--virtio-iso`, `--spice-exe` and `--cloudbase-msi` for air-gapped sites.
+
+Product keys never appear in `--dry-run` output, in diagnostics, or in any process table.
+
+**Supported matrix:**
+
+| Release | `ostype` | Server Core | Desktop Experience | Standard | Datacenter |
+|---|---|---|---|---|---|
+| Windows Server 2019 | `win10` | yes | yes | yes | yes |
+| Windows Server 2022 | `win11` | yes | yes | yes | yes |
+| Windows Server 2025 | `win11` | yes | yes | yes | yes |
+
+x86_64 and UEFI/GPT only. PVE has no `win2k19`/`win2k22` ostype — `win10` covers 2016/2019 and `win11` covers 2022/2025.
+
+**Usage:**
+
+```bash
+# Core + Desktop Standard templates from your own ISO
+pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01
+
+# Evaluation media, Datacenter, Core only, built on an uplink-less bridge
+pve-build-windows-template --eval 2025 --sku datacenter --edition core \
+    --storage dstore01 --build-bridge vmbr1 --start-id 9040
+
+# Licensed media activated against KMS
+pve-build-windows-template --iso /mnt/iso/win2022-vl.iso --kms --storage dstore01
+
+# Remote build from a jump host (paths are remote)
+pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 \
+    -S root@pve1.example.com
+
+# Print the full plan and touch nothing
+pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --dry-run
+```
+
+**Key parameters:**
+
+| Parameter | Description | Default |
+|---|---|---|
+| `-i, --iso PATH` | Windows ISO — path or `STORAGE:iso/NAME`. Never auto-downloaded | *(required unless `--eval`)* |
+| `--eval RELEASE` | Download Microsoft 180-day evaluation media (`2019`/`2022`/`2025`) | off |
+| `-e, --edition WHICH` | `core` \| `desktop` \| `both` | `both` |
+| `-k, --sku SKU` | `standard` \| `datacenter` | `standard` |
+| `-R, --release REL` | `2019` \| `2022` \| `2025` | auto-detected from the media |
+| `-s, --storage NAME` | Storage for VM disks | `local-lvm` |
+| `--iso-storage NAME` | Storage for downloaded/generated ISOs (must accept `iso`) | `--storage` |
+| `-I, --start-id ID` | First VMID; one per edition, consecutive | `9020` |
+| `-B, --bridge NAME` / `--vlan TAG` | Template NIC placement | `vmbr0` |
+| `--build-bridge NAME` | Bridge for the build VM — an uplink-less one is recommended | `--bridge` |
+| `-D, --disk-size GB` | OS disk size | `60` |
+| `--product-key KEY` / `--kms` | Activation; omitting both is valid (deferred activation) | none |
+| `--admin-password PW` | Administrator password | random, printed once |
+| `--no-tpm` / `--no-secureboot` | Drop the TPM 2.0 volume / pre-enrolled Secure Boot keys | both on |
+| `--keep-on-failure` | Leave the build VM in place for inspection | off |
+| `-m, --mode`, `-S, --server` | Local vs. remote execution | local |
+| `--dry-run`, `--help`, `--version` | Repo-wide conventions | — |
+
+**Workflow:**
+
+1. Resolve the Windows media, virtio-win ISO, Cloudbase-Init MSI and spice-guest-tools, caching each under the ISO storage
+2. Mount the Windows media (UDF) and read the image list with `wiminfo` — auto-detect the release, detect evaluation media, resolve the exact `/IMAGE/NAME` for the requested SKU and edition
+3. Flatten the release-specific virtio drivers and stage **every** in-guest payload onto a generated answer ISO — the build VM needs no network access at all
+4. Create the build VM (`ovmf` + `q35` + `virtio-scsi-single` + TPM 2.0 + Secure Boot) and start it
+5. Wait for Setup, then for payload installation reported through the QEMU guest agent, then for sysprep's own shutdown
+6. Verify offline that `Sysprep_succeeded.tag` exists on the disk, detach every CD-ROM, attach the cloud-init drive, `qm template`
+
+Everything installed in the guest — virtio drivers, QEMU guest agent, SPICE agent and Cloudbase-Init — is staged from the host onto the answer ISO. The build VM never downloads anything, so an air-gapped node builds exactly the same template as a connected one.
+
+### Cloud-init on Windows
+
+PVE presents cloud-init to Windows guests as an OpenStack config-drive (`citype configdrive2`, the default for any Windows `ostype`), so the generated Cloudbase-Init configuration uses `ConfigDriveService`. Three behaviours differ from a Linux template:
+
+| Setting | Behaviour on a Windows clone |
+|---|---|
+| `--ciuser` | **No-op.** Cloudbase-Init acts on the account named in its own config file. Fixed at build time by `--ci-username` (default `Administrator`) |
+| `--cipassword` | Works — arrives as `admin_pass` in `meta_data.json` and is applied to the managed account. Note `qm cloudinit dump <id> meta` does **not** show it: that subcommand renders the generic config-drive metadata, not the Cloudbase-Init variant PVE actually generates for Windows guests |
+| `--sshkeys` | Works — written to `C:\Users\<ci-username>\.ssh\authorized_keys`. Windows Server has no SSH server by default, so the keys sit unused until you install the OpenSSH Server feature |
+| `--name` (hostname) | Works, but **only** because `UserDataPlugin` is enabled. PVE's Windows `meta_data.json` carries no `hostname` key; the hostname arrives inside `user_data` as cloud-config. Removing `UserDataPlugin` from `cloudbase-init.conf` silently breaks `qm clone --name` |
+| `qm resize` | Works — `ExtendVolumesPlugin` grows `C:`. The generated disk layout deliberately omits a trailing WinRE recovery partition, which would otherwise make `C:` unextendable |
+
+```bash
+qm clone 9020 130 --name winsrv01 --full
+qm set 130 --ipconfig0 ip=10.0.0.30/24,gw=10.0.0.1 --nameserver 10.0.0.1
+qm set 130 --cipassword 'secret' --sshkeys ~/.ssh/id_ed25519.pub
+qm start 130
+```
+
+**Limitations:**
+
+- Windows Server only — desktop Windows editions are not supported
+- UEFI/GPT only; no BIOS/MBR installs
+- Domain join at build time is out of scope — it belongs at clone time
+- Single NIC only. PVE's Windows config-drive writes the network configuration as Debian ENI with no MAC address, so the interface mapping is ambiguous with more than one NIC
+- Cloudbase-Init is always installed; there is no `--no-cloudbase-init` escape hatch in this release
+- The virtio-win `qxldod` display driver has no INF for Server 2022 or 2025, so `--vga std` is the default. spice-guest-tools (and the vdagent service) is installed regardless — the display type is a clone-time decision via `qm set <id> --vga qxl`
+- The virtio-win ISO must be new enough for the target release; the script refuses to build rather than producing a broken template
+
+**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `genisoimage` (or `mkisofs`), `wiminfo` (wimtools), `guestfish` (libguestfs-tools), `curl`, `python3`.
+
+**Dependencies (remote mode):** `ssh` and `scp` only (PVE tools are used on the remote node).
+
+---
+
 ## pve-sdn-healthcheck
 
 Validate the entire network layer of a Proxmox VE + FRR/BGP-EVPN/VXLAN cluster
@@ -472,7 +597,7 @@ echo "deb [signed-by=/usr/share/keyrings/pve-tools.gpg] $REPO/ /" \
 apt update && apt install pve-tools
 ```
 
-This installs the six scripts to `/usr/sbin`, their man pages to
+This installs the seven scripts to `/usr/sbin`, their man pages to
 `/usr/share/man/man8`, and the bash completion to
 `/usr/share/bash-completion/completions`. Updates then arrive with the usual
 `apt upgrade`. To install a single `.deb` without adding the repo, download it
@@ -484,7 +609,7 @@ from the `Debian_12/all/` (or `Debian_13/all/`) directory and run
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade pve-build-windows-template /usr/local/sbin/
 ```
 
 Man pages are provided in `man/man8/`. To install them:

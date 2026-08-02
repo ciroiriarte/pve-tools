@@ -2,7 +2,7 @@
 # pve-tools is a bundle of standalone bash scripts — nothing to compile.
 # Install the scripts, man pages and bash completion directly.
 
-SCRIPTS = pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade
+SCRIPTS = pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade pve-build-windows-template
 PKGDIR  = debian/pve-tools
 
 %:

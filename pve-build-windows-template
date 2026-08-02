@@ -1,0 +1,2073 @@
+#!/bin/bash
+
+# pve-build-windows-template — Build sysprepped, cloud-init-capable Windows
+# Server templates on Proxmox VE, unattended.
+#
+# Two modes of operation:
+#
+#   LOCAL MODE  — run directly on a PVE node (as root).
+#     Example:  pve-build-windows-template --iso dstore01:iso/win2022.iso \
+#                   --storage dstore01
+#
+#   REMOTE MODE — run from a jump host, specify the PVE node with -S.
+#     The script copies itself to the remote node and re-executes there.
+#     The template stays on the node — nothing is downloaded back.
+#     Example:  pve-build-windows-template --iso dstore01:iso/win2022.iso \
+#                   --storage dstore01 -S root@pve1
+#
+# What it does, per requested edition:
+#
+#   1. Resolves the Windows media.  --iso is the primary input and is NEVER
+#      downloaded automatically.  --eval RELEASE opts in to downloading
+#      Microsoft's freely-redistributable 180-day evaluation ISO.
+#   2. Resolves the virtio-win driver ISO (auto-downloaded, redistributable;
+#      override with --virtio-iso for air-gapped sites).
+#   3. Stages every in-guest payload ON THE HOST and bakes it into a small
+#      generated answer ISO: the virtio drivers (flattened), the QEMU guest
+#      agent MSI (extracted from the virtio ISO), spice-guest-tools and the
+#      Cloudbase-Init MSI.  The build VM therefore needs NO internet access.
+#   4. Generates Autounattend.xml driving a fully unattended UEFI/GPT install:
+#      virtio storage + NIC driver injection so Setup sees the disk, edition
+#      selection, locale/timezone/admin password, then a SetupComplete.cmd
+#      that installs the agents and Cloudbase-Init and finally syspreps.
+#   5. Creates the build VM (ovmf + q35 + TPM 2.0 + Secure Boot), waits for
+#      sysprep's own shutdown, verifies the result offline, detaches every
+#      CD-ROM, attaches the cloud-init drive and runs  qm template .
+#
+# LICENSING — the script never downloads, caches or redistributes Windows
+# media or a licence key unless the operator explicitly asks for the
+# Microsoft evaluation media with --eval.  Product keys are supplied by the
+# operator (--product-key / --kms) and are masked in all output.
+#
+# Prerequisites (on the PVE host):
+#   - Proxmox VE 8.x or later
+#   - genisoimage or mkisofs   (answer ISO authoring)
+#   - wimlib-imagex / wiminfo  (Windows image inspection)
+#   - libguestfs-tools         (virt-cat, virt-ls — offline verification)
+#   - curl, python3
+#
+# Reference: https://pve.proxmox.com/wiki/Windows_2025_guest_best_practices
+#
+# See --help for full usage.
+
+VERSION="1.0.0"
+
+set -euo pipefail
+
+# --- Colours (disabled when stdout is not a terminal) -------------------------
+
+if [[ -t 1 ]]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_CYAN='\033[0;36m'
+    C_BOLD='\033[1m'
+    C_RESET='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+fi
+
+# --- Helpers ------------------------------------------------------------------
+
+msg()  { echo -e "${C_BOLD}${C_CYAN}::${C_RESET} $*"; }
+ok()   { echo -e "   ${C_GREEN}[+]${C_RESET} $*"; }
+warn() { echo -e "   ${C_YELLOW}[!]${C_RESET} $*"; }
+err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
+die()  { err "$@"; exit 1; }
+
+run() {
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} $*"
+    else
+        "$@"
+    fi
+}
+
+# Mask product keys and passwords in any text passed through.  Applied to
+# every generated file we ever print (dry-run dumps, diagnostics).
+redact() {
+    sed -E \
+        -e 's#<Key>[^<]*</Key>#<Key>XXXXX-XXXXX-XXXXX-XXXXX-XXXXX</Key>#g' \
+        -e 's#<ProductKey>[^<]*</ProductKey>#<ProductKey>XXXXX-XXXXX-XXXXX-XXXXX-XXXXX</ProductKey>#g' \
+        -e 's#(<AdministratorPassword>.*<Value>)[^<]*#\1********#g' \
+        -e 's#(<Value>)[^<]*(</Value>)#\1********\2#g'
+}
+
+# Like run(), but never echoes the arguments — used for anything carrying a
+# product key or a password.  The caller supplies a safe description.
+run_secret() {
+    local desc="$1"; shift
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} ${desc}"
+    else
+        "$@"
+    fi
+}
+
+# --- Defaults -----------------------------------------------------------------
+
+DRY_RUN=0
+PVE_SERVER=""                 # empty = local mode; USER@HOST = remote mode
+MODE=""                       # explicit --mode local|remote (optional)
+
+WIN_ISO=""                    # --iso   (path or STORAGE:iso/NAME)
+EVAL_RELEASE=""               # --eval  2019|2022|2025
+RELEASE=""                    # --release, auto-detected from media when empty
+EDITION="both"                # core|desktop|both
+SKU="standard"                # standard|datacenter
+
+STORAGE="local-lvm"           # VM disk storage
+ISO_STORAGE=""                # storage for generated/downloaded ISOs
+START_ID=9020                 # first VMID
+BRIDGE="vmbr0"                # template NIC bridge
+VLAN=""                       # template NIC VLAN tag
+BUILD_BRIDGE=""               # build VM bridge (default: $BRIDGE)
+DISK_SIZE=60                  # OS disk size in GB
+CPU_TYPE="x86-64-v2-AES"      # migration-safe; never host/max (repo policy)
+CORES=2                       # template sizing
+MEMORY=4096
+BUILD_CORES=4                 # build VM sizing
+BUILD_MEMORY=8192
+VGA="std"                     # std|qxl|virtio
+USE_TPM=1
+USE_SECUREBOOT=1
+
+LOCALE="en-US"
+INPUT_LOCALE=""               # defaults to $LOCALE
+TIMEZONE="UTC"
+FULLNAME="Proxmox VE"
+ORGANIZATION="pve-tools"
+
+PRODUCT_KEY=""
+PRODUCT_KEY_FILE=""
+USE_KMS=0
+ADMIN_PASSWORD=""
+ADMIN_PASSWORD_FILE=""
+CI_USERNAME="Administrator"
+
+VIRTIO_ISO=""                 # --virtio-iso override
+CLOUDBASE_MSI=""              # --cloudbase-msi override
+SPICE_EXE=""                  # --spice-exe override
+
+CACHE_DIR=""                  # payload cache; default derived from ISO storage
+REFRESH_CACHE=0
+KEEP_ANSWER_ISO=0
+KEEP_ON_FAILURE=0
+FORCE=0
+
+INSTALL_TIMEOUT=3600          # WinPE + Setup + OOBE, until the agent answers
+PAYLOAD_TIMEOUT=1800          # agent up -> INSTALLS-DONE
+SYSPREP_TIMEOUT=1800          # reboot + sysprep -> powered off
+
+# Redistributable payload sources (see LICENSING above — none of these is
+# Microsoft Windows media).
+VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+CLOUDBASE_URL="https://cloudbase.it/downloads/CloudbaseInitSetup_Stable_x64.msi"
+SPICE_URL="https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe"
+EVAL_URL_BASE="https://go.microsoft.com/fwlink/?linkid="
+EVAL_URL_SUFFIX="&clcid=0x409&culture=en-us&country=us"
+
+# Internal state (set during execution)
+TIMESTAMP=$(date +%Y%m%d%H%M)
+BUILD_ID=""
+BUILD_VMID=""                 # non-empty while a build VM exists
+STAGE_DIR=""
+ANSWER_ISO_PATH=""
+ISO_DIR=""                    # <iso-storage>/template/iso
+WIN_ISO_PATH=""               # resolved absolute path to the Windows ISO
+VIRTIO_ISO_PATH=""
+CLOUDBASE_MSI_PATH=""
+SPICE_EXE_PATH=""
+IMAGE_NAME=""                 # exact /IMAGE/NAME for the current edition
+IS_EVAL_MEDIA=0
+VIRTIO_VERSION=""
+MOUNTED=()                    # loop mounts, unmounted LIFO by cleanup()
+MNT=""                        # most recent mount_iso() result
+CURRENT_EDITION=""            # edition being built right now
+SKIPPED=0                     # editions skipped because the VMID was in use
+GUEST_STATE=""                # final contents of the guest's state.txt
+WIM_NAMES=""
+SHOW_ANSWER_FILE=0
+
+# The drivers we flatten onto the answer ISO.  Names are the directory names
+# on the virtio-win ISO; they are collision-free when flattened.
+VIRTIO_DRIVERS=( vioscsi viostor NetKVM Balloon vioserial )
+
+# --- Release matrix -----------------------------------------------------------
+
+# PVE has no win2k19/win2k22 ostype — only win7/win8/win10/win11.
+# win10 covers "Windows 10/2016/2019"; win11 covers "Windows 11/2022/2025".
+release_ostype() {
+    case "$1" in
+        2019) echo "win10" ;;
+        2022|2025) echo "win11" ;;
+        *) die "Unsupported release: $1 (expected 2019, 2022 or 2025)" ;;
+    esac
+}
+
+# Per-OS subdirectory name inside each driver directory on the virtio-win ISO.
+release_virtio_dir() {
+    case "$1" in
+        2019) echo "2k19" ;;
+        2022) echo "2k22" ;;
+        2025) echo "2k25" ;;
+        *) die "Unsupported release: $1" ;;
+    esac
+}
+
+# Microsoft Evaluation Center fwlink IDs.  Always use the fwlink form — the
+# resolved software-static.download.prss.microsoft.com URL is rotated with
+# every servicing refresh, which is also why no checksum is pinned.
+release_eval_linkid() {
+    case "$1" in
+        2019) echo "2195167" ;;
+        2022) echo "2195280" ;;
+        2025) echo "2293312" ;;
+        *) die "No evaluation media known for release: $1" ;;
+    esac
+}
+
+# Public Microsoft KMS client setup keys (GVLK).  Core and Desktop share a
+# key — the Core/Desktop axis is not a licensing axis, so do not "fix" this
+# by adding an edition dimension.
+# https://learn.microsoft.com/windows-server/get-started/kms-client-activation-keys
+gvlk_key() {
+    case "$1:$2" in
+        2025:standard)   echo "TVRH6-WHNXV-R9WG3-9XRFY-MY832" ;;
+        2025:datacenter) echo "D764K-2NDRG-47T6Q-P8T8W-YP6DF" ;;
+        2022:standard)   echo "VDYBN-27WPP-V4HQT-9VMD4-VMK7H" ;;
+        2022:datacenter) echo "WX4NM-KYWYW-QJJR4-XV3QB-6VM33" ;;
+        2019:standard)   echo "N69G4-B89J2-4G8F4-WWYCC-J464C" ;;
+        2019:datacenter) echo "WMDGN-G9PQG-XVVXX-R3X43-63DFG" ;;
+        *) die "No GVLK known for release '$1' SKU '$2'" ;;
+    esac
+}
+
+# Windows image name suffix for a SKU x edition pair, as it appears in the
+# WIM metadata (e.g. "Windows Server 2022 SERVERSTANDARDCORE").
+image_name_suffix() {
+    local sku="$1" edition="$2"
+    local base
+    case "$sku" in
+        standard)   base="SERVERSTANDARD" ;;
+        datacenter) base="SERVERDATACENTER" ;;
+        *) die "Unsupported SKU: $sku" ;;
+    esac
+    case "$edition" in
+        core)    echo "${base}CORE" ;;
+        desktop) echo "${base}" ;;
+        *) die "Unsupported edition: $edition" ;;
+    esac
+}
+
+# --- Cleanup ------------------------------------------------------------------
+
+# Unmount every loop mount we made, most recent first.
+umount_isos() {
+    local i
+    for (( i = ${#MOUNTED[@]} - 1; i >= 0; i-- )); do
+        umount "${MOUNTED[$i]}" 2>/dev/null || true
+        rmdir "${MOUNTED[$i]}" 2>/dev/null || true
+    done
+    MOUNTED=()
+}
+
+# Wait for a VM to reach the stopped state.
+wait_stopped() {
+    local vmid="$1" timeout="${2:-60}"
+    local waited=0 st
+    while (( waited < timeout )); do
+        st=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || return 0
+        [[ "$st" == "stopped" ]] && return 0
+        sleep 2
+        (( waited += 2 ))
+    done
+    return 1
+}
+
+cleanup() {
+    local rc=$?
+
+    umount_isos
+
+    if [[ -n "$BUILD_VMID" ]] && (( ! DRY_RUN )); then
+        if (( KEEP_ON_FAILURE )); then
+            warn "Preserving build VM ${BUILD_VMID} for inspection (--keep-on-failure)"
+        elif qm status "$BUILD_VMID" &>/dev/null 2>&1; then
+            dump_failure_diagnostics "$BUILD_VMID" || true
+            msg "Cleaning up build VM ${BUILD_VMID}..."
+            qm stop "$BUILD_VMID" --timeout 30 2>/dev/null || true
+            wait_stopped "$BUILD_VMID" 60 || true
+            qm destroy "$BUILD_VMID" --purge 2>/dev/null || \
+                warn "Could not destroy VM ${BUILD_VMID} — clean up manually"
+        fi
+    fi
+
+    if (( ! KEEP_ANSWER_ISO )) && [[ -n "$ANSWER_ISO_PATH" ]]; then
+        rm -f "$ANSWER_ISO_PATH"
+    fi
+    [[ -n "$CACHE_DIR" && -d "$CACHE_DIR" ]] && rm -f "$CACHE_DIR"/*.part
+    [[ -n "$ISO_DIR"   && -d "$ISO_DIR"   ]] && rm -f "$ISO_DIR"/*.part
+    [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]] && rm -rf "$STAGE_DIR"
+
+    return $rc
+}
+
+trap cleanup EXIT
+
+# --- Preflight ----------------------------------------------------------------
+
+check_deps() {
+    local -a missing=()
+    local cmd
+    for cmd in qm pvesm pvesh curl python3 mount umount; do
+        command -v "$cmd" &>/dev/null || missing+=( "$cmd" )
+    done
+    command -v genisoimage &>/dev/null || command -v mkisofs &>/dev/null || \
+        missing+=( "genisoimage or mkisofs" )
+    command -v wiminfo &>/dev/null || command -v wimlib-imagex &>/dev/null || \
+        missing+=( "wiminfo (wimtools)" )
+    command -v guestfish &>/dev/null || missing+=( "guestfish (libguestfs-tools)" )
+
+    if (( ${#missing[@]} )); then
+        err "Missing required commands:"
+        printf '     - %s\n' "${missing[@]}" >&2
+        die "Install them and retry (Debian: apt install genisoimage wimtools libguestfs-tools)"
+    fi
+}
+
+# wiminfo is the wimlib CLI; older packages only ship wimlib-imagex.
+wim_info() {
+    if command -v wiminfo &>/dev/null; then
+        wiminfo "$@"
+    else
+        wimlib-imagex info "$@"
+    fi
+}
+
+iso_authoring_tool() {
+    if command -v genisoimage &>/dev/null; then
+        echo genisoimage
+    else
+        echo mkisofs
+    fi
+}
+
+# Absolute filesystem path of a PVE storage.
+storage_path() {
+    local name="$1" path
+    path=$(pvesh get "/storage/${name}" --output-format json 2>/dev/null \
+           | python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))') \
+        || die "Storage '${name}' does not exist"
+    [[ -n "$path" ]] || die "Storage '${name}' has no filesystem path (needs a 'dir' or 'nfs' type storage for ISOs)"
+    echo "$path"
+}
+
+# Does a storage accept a given content type?
+storage_supports() {
+    local name="$1" content="$2"
+    pvesh get "/storage/${name}" --output-format json 2>/dev/null \
+        | python3 -c "import json,sys; print('$content' in json.load(sys.stdin).get('content',''))" \
+        | grep -q True
+}
+
+check_free_space() {
+    local path="$1" need_gb="$2" avail_gb
+    avail_gb=$(df -BG --output=avail "$path" 2>/dev/null | tail -1 | tr -dc '0-9')
+    [[ -n "$avail_gb" ]] || return 0
+    (( avail_gb >= need_gb )) || \
+        die "Only ${avail_gb}G free on ${path} — need at least ${need_gb}G (use --cache-dir / --iso-storage to point elsewhere)"
+}
+
+vmid_exists() {
+    qm status "$1" &>/dev/null 2>&1 || pct status "$1" &>/dev/null 2>&1
+}
+
+# Turn "--iso" input into an absolute path.  Accepts STORAGE:iso/NAME volids
+# and plain filesystem paths.
+resolve_iso_path() {
+    local ref="$1" path
+    if [[ "$ref" == *:*/* || "$ref" == *:iso/* ]]; then
+        path=$(pvesm path "$ref" 2>/dev/null) || die "Cannot resolve volume: $ref"
+    else
+        path="$ref"
+    fi
+    [[ -f "$path" ]] || die "ISO not found: $path"
+    echo "$path"
+}
+
+# Turn an absolute path back into a STORAGE:iso/NAME volid so qm can attach
+# it.  Any ISO-capable storage is searched, not just --iso-storage, because
+# --iso and --virtio-iso routinely live on a different one.
+iso_attach_ref() {
+    local path="$1" store spath
+
+    if [[ "$path" == "${ISO_DIR}/"* ]]; then
+        echo "${ISO_STORAGE}:iso/$(basename "$path")"
+        return 0
+    fi
+
+    while read -r store; do
+        [[ -n "$store" ]] || continue
+        spath=$(pvesh get "/storage/${store}" --output-format json 2>/dev/null \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))') || continue
+        [[ -n "$spath" ]] || continue
+        if [[ "$path" == "${spath}/template/iso/"* ]]; then
+            echo "${store}:iso/$(basename "$path")"
+            return 0
+        fi
+    done < <(pvesh get /storage --output-format json 2>/dev/null \
+             | python3 -c 'import json,sys
+for s in json.load(sys.stdin):
+    if "iso" in s.get("content", ""):
+        print(s["storage"])' 2>/dev/null)
+
+    die "Cannot attach ${path}: it is not under any ISO-capable storage. Copy it into <storage>/template/iso/ or pass it as STORAGE:iso/NAME."
+}
+
+# --- Media acquisition --------------------------------------------------------
+
+# Download to "$dest" atomically, resuming a partial transfer if present.
+# Never overwrites an existing complete file unless --refresh-cache.
+download_file() {
+    local url="$1" dest="$2" what="${3:-$(basename "$2")}"
+
+    if [[ -f "$dest" ]] && (( ! REFRESH_CACHE )); then
+        ok "Cached: ${what}"
+        return 0
+    fi
+
+    msg "Downloading ${what}..."
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} download ${url} → ${dest}"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    (( REFRESH_CACHE )) && rm -f "$dest"
+
+    # A progress bar redirected to a log file is thousands of useless lines.
+    local -a progress=( -s )
+    [[ -t 1 ]] && progress=( --progress-bar )
+
+    local attempt rc=1
+    for attempt in 1 2 3; do
+        if (( attempt > 1 )); then
+            warn "Retry ${attempt}/3: ${what}"
+            sleep 2
+        fi
+        if curl -fL --retry 2 "${progress[@]}" -C - -o "${dest}.part" "$url"; then
+            rc=0; break
+        fi
+    done
+
+    if (( rc )); then
+        rm -f "${dest}.part"
+        die "Download failed: ${url}"
+    fi
+    mv "${dest}.part" "$dest"
+    ok "Downloaded: ${what}"
+}
+
+# Resolve the effective filename behind a redirecting URL so the cache key
+# carries the upstream version (e.g. CloudbaseInitSetup_1_1_8_x64.msi).
+resolved_basename() {
+    local url="$1" fallback="$2" final
+    final=$(curl -fsIL -o /dev/null -w '%{url_effective}' --max-time 30 "$url" 2>/dev/null) || {
+        echo "$fallback"; return 0
+    }
+    final="${final%%\?*}"
+    final="${final##*/}"
+    [[ -n "$final" && "$final" == *.* ]] && echo "$final" || echo "$fallback"
+}
+
+# The fetch_* helpers set their target global directly rather than echoing a
+# path — they also emit progress on stdout, which a command substitution
+# would otherwise swallow into the result.
+
+fetch_eval_iso() {
+    local rel="$1" linkid url
+    linkid=$(release_eval_linkid "$rel")
+    url="${EVAL_URL_BASE}${linkid}${EVAL_URL_SUFFIX}"
+    local dest="${ISO_DIR}/win${rel}-eval-en-us.iso"
+
+    warn "Downloading Microsoft evaluation media for Server ${rel} (180-day trial)."
+    warn "The resulting template is an evaluation install — supply --product-key"
+    warn "or use non-eval media for a production template."
+    download_file "$url" "$dest" "Windows Server ${rel} evaluation ISO (~5-6 GB)"
+
+    if [[ -f "$dest" ]]; then
+        local size
+        size=$(stat -c %s "$dest")
+        (( size >= 4294967296 )) || \
+            die "Downloaded file is only ${size} bytes — Microsoft may have gated the Evaluation Center behind a registration form. Download the ISO manually and pass it with --iso."
+    fi
+    WIN_ISO_PATH="$dest"
+}
+
+fetch_virtio_iso() {
+    local name
+    name=$(resolved_basename "$VIRTIO_URL" "virtio-win.iso")
+    VIRTIO_ISO_PATH="${ISO_DIR}/${name}"
+    download_file "$VIRTIO_URL" "$VIRTIO_ISO_PATH" "virtio-win driver ISO (${name})"
+}
+
+fetch_cloudbase_msi() {
+    local name
+    name=$(resolved_basename "$CLOUDBASE_URL" "CloudbaseInitSetup_x64.msi")
+    CLOUDBASE_MSI_PATH="${CACHE_DIR}/${name}"
+    download_file "$CLOUDBASE_URL" "$CLOUDBASE_MSI_PATH" "Cloudbase-Init (${name})"
+}
+
+fetch_spice_tools() {
+    SPICE_EXE_PATH="${CACHE_DIR}/spice-guest-tools.exe"
+    download_file "$SPICE_URL" "$SPICE_EXE_PATH" "spice-guest-tools"
+}
+
+# --- Media inspection ---------------------------------------------------------
+
+# Windows Server ISOs are UDF, not ISO9660 — isoinfo/bsdtar silently return
+# only README.TXT.  Loop-mounting is the reliable way in.
+#
+# Sets MNT rather than echoing: the mount has to be recorded in MOUNTED so
+# cleanup() can unmount it, and a command substitution would lose that.
+mount_iso() {
+    local iso="$1" mnt
+    mnt=$(mktemp -d /tmp/pve-winbuild-mnt-XXXXXX)
+    mount -o loop,ro "$iso" "$mnt" 2>/dev/null || {
+        rmdir "$mnt"
+        die "Cannot mount ${iso} (expected a UDF/ISO9660 image)"
+    }
+    MOUNTED+=( "$mnt" )
+    MNT="$mnt"
+}
+
+# Inspect the Windows media: list the images it contains, detect whether it
+# is evaluation media, and derive the release when --release was not given.
+probe_windows_iso() {
+    local mnt="$1"
+    local wim="${mnt}/sources/install.wim"
+    [[ -f "$wim" ]] || wim="${mnt}/sources/install.esd"
+    [[ -f "$wim" ]] || die "No sources/install.wim or install.esd on the media — is this a Windows installation ISO?"
+
+    WIM_NAMES=$(wim_info "$wim" | sed -n 's/^Name:[[:space:]]*//p')
+    [[ -n "$WIM_NAMES" ]] || die "Could not read image names from ${wim}"
+
+    # Evaluation media carries sources/EI.CFG with [Channel] eval, which is
+    # what suppresses Setup's product-key page.
+    IS_EVAL_MEDIA=0
+    if [[ -f "${mnt}/sources/EI.CFG" ]] && grep -qi 'eval' "${mnt}/sources/EI.CFG"; then
+        IS_EVAL_MEDIA=1
+    elif wim_info "$wim" | grep -qi '^Edition ID:.*Eval'; then
+        IS_EVAL_MEDIA=1
+    fi
+
+    if [[ -z "$RELEASE" ]]; then
+        local r
+        for r in 2025 2022 2019; do
+            if grep -q "Windows Server ${r} " <<< "$WIM_NAMES"; then
+                RELEASE="$r"; break
+            fi
+        done
+        [[ -n "$RELEASE" ]] || die "Cannot detect the Windows Server release from the media — pass --release 2019|2022|2025. Images found:
+$(sed 's/^/     /' <<< "$WIM_NAMES")"
+        ok "Detected release: Windows Server ${RELEASE}$( (( IS_EVAL_MEDIA )) && echo ' (evaluation media)' )"
+    else
+        grep -q "Windows Server ${RELEASE} " <<< "$WIM_NAMES" || \
+            warn "--release ${RELEASE} given but no matching image name on the media"
+    fi
+}
+
+# Pick the exact /IMAGE/NAME for a SKU x edition pair out of the media.
+select_image_name() {
+    local edition="$1"
+    local want suffix
+    suffix=$(image_name_suffix "$SKU" "$edition")
+    want="Windows Server ${RELEASE} ${suffix}"
+
+    # Exact match first; fall back to a suffix match for localized or
+    # differently-prefixed media.
+    if grep -qxF "$want" <<< "$WIM_NAMES"; then
+        IMAGE_NAME="$want"
+    else
+        IMAGE_NAME=$(grep -E "(^|[[:space:]])${suffix}\$" <<< "$WIM_NAMES" | head -1 || true)
+    fi
+
+    [[ -n "$IMAGE_NAME" ]] || die "No '${suffix}' image on this media. Available images:
+$(sed 's/^/     /' <<< "$WIM_NAMES")"
+    ok "Image: ${IMAGE_NAME}"
+}
+
+# Verify the virtio ISO carries every driver we need for this release, and
+# record its version for the template notes.
+probe_virtio_iso() {
+    local mnt="$1"
+    local osdir drv src
+    osdir=$(release_virtio_dir "$RELEASE")
+
+    for drv in "${VIRTIO_DRIVERS[@]}"; do
+        src="${mnt}/${drv}/${osdir}/amd64"
+        [[ -d "$src" ]] || die "virtio-win ISO has no ${drv}/${osdir}/amd64 — it predates Windows Server ${RELEASE}. Use a newer virtio-win ISO or pass --virtio-iso."
+    done
+
+    [[ -f "${mnt}/guest-agent/qemu-ga-x86_64.msi" ]] || \
+        die "virtio-win ISO has no guest-agent/qemu-ga-x86_64.msi"
+
+    VIRTIO_VERSION=$(basename "$VIRTIO_ISO_PATH" .iso)
+    ok "virtio drivers present for ${osdir} (${VIRTIO_VERSION})"
+}
+
+# --- Answer media generation --------------------------------------------------
+
+# Flatten the release-specific drivers into a single <stage>/drivers folder.
+# Flattening removes any chance of Setup picking a wrong-OS INF from a
+# sibling tree, and means DriverPaths needs no recursion.
+stage_drivers() {
+    local mnt="$1"
+    local osdir drv src
+    osdir=$(release_virtio_dir "$RELEASE")
+
+    mkdir -p "${STAGE_DIR}/drivers"
+    for drv in "${VIRTIO_DRIVERS[@]}"; do
+        src="${mnt}/${drv}/${osdir}/amd64"
+        cp -a "${src}/." "${STAGE_DIR}/drivers/"
+    done
+    ok "Staged $(ls -1 "${STAGE_DIR}/drivers" | wc -l) driver files ($(printf '%s ' "${VIRTIO_DRIVERS[@]}"))"
+}
+
+# Everything the guest needs, copied onto the answer ISO.  The build VM
+# never downloads anything.
+# A dry run never downloads, so the payloads may legitimately be absent —
+# report the intent instead of failing.
+stage_copy() {
+    local src="$1" dest="$2"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$dest"
+    elif (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} stage $(basename "$src") → $(basename "$dest")"
+    else
+        die "Payload missing: $src"
+    fi
+}
+
+stage_payloads() {
+    local mnt="$1"
+
+    mkdir -p "${STAGE_DIR}/pvebuild"
+    echo "$BUILD_ID" > "${STAGE_DIR}/pvebuild/pvebuild.id"
+
+    stage_copy "${mnt}/guest-agent/qemu-ga-x86_64.msi" "${STAGE_DIR}/pvebuild/qemu-ga-x86_64.msi"
+    if [[ -f "${mnt}/virtio-win-gt-x64.msi" ]]; then
+        cp "${mnt}/virtio-win-gt-x64.msi" "${STAGE_DIR}/pvebuild/virtio-win-gt-x64.msi"
+    else
+        warn "virtio-win-gt-x64.msi not on the virtio ISO — relying on Setup driver injection only"
+    fi
+    stage_copy "$CLOUDBASE_MSI_PATH" "${STAGE_DIR}/pvebuild/CloudbaseInitSetup_x64.msi"
+    stage_copy "$SPICE_EXE_PATH"     "${STAGE_DIR}/pvebuild/spice-guest-tools.exe"
+    ok "Staged in-guest payloads (qemu-ga, virtio-win-gt, Cloudbase-Init, spice-guest-tools)"
+}
+
+# The <ProductKey> block for the windowsPE pass.  Empty unless the operator
+# supplied a literal key — Microsoft documents that an empty <Key> element is
+# unsupported, so we omit the whole element instead.
+productkey_block() {
+    [[ -n "$PRODUCT_KEY" ]] || return 0
+    cat <<EOF
+                <ProductKey>
+                    <Key>${PRODUCT_KEY}</Key>
+                    <WillShowUI>Never</WillShowUI>
+                </ProductKey>
+EOF
+}
+
+# The activation key for the specialize pass (--kms only).  The windowsPE
+# key selects the image; this one activates the installed system.
+specialize_productkey_block() {
+    (( USE_KMS )) || return 0
+    echo "            <ProductKey>$(gvlk_key "$RELEASE" "$SKU")</ProductKey>"
+}
+
+# Microsoft caps RunSynchronousCommand/Path at 259 characters (MAX_PATH) and
+# rejects the entire answer file with an unhelpful "Value is invalid." when it
+# is exceeded — a failure that only surfaces in the specialize pass, roughly
+# twenty minutes into a build.  Fail here instead.
+check_rsc_path() {
+    local order="$1" path="$2"
+    (( ${#path} <= 259 )) || \
+        die "RunSynchronousCommand Order=${order} Path is ${#path} characters; Windows Setup rejects anything over 259. Shorten it in generate_autounattend()."
+}
+
+generate_autounattend() {
+    local dest="${STAGE_DIR}/Autounattend.xml"
+    local drive_paths="" letter idx=1
+
+    # Kept deliberately terse — see the 259-character cap above.  -Command
+    # takes a string, not a script file, so -ExecutionPolicy is irrelevant.
+    local RSC_PATH_1='powershell -NoProfile -Command "67..90|ForEach-Object{$r=[char]$_+'"'"':\pvebuild'"'"';if(Test-Path ($r+'"'"'\pvebuild.id'"'"')){Copy-Item $r '"'"'C:\'"'"' -Recurse -Force}};exit 0"'
+    local RSC_PATH_2='cmd.exe /c C:\pvebuild\stage.cmd'
+
+    check_rsc_path 1 "$RSC_PATH_1"
+    check_rsc_path 2 "$RSC_PATH_2"
+
+    # WinPE assigns C:..J: to the optical drives by enumeration order, not by
+    # the qm slot, so every plausible letter is offered.  Setup logs and
+    # continues past the ones that do not exist.
+    for letter in C D E F G H I J; do
+        drive_paths+="                    <PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"${idx}\">
+                        <Path>${letter}:\\drivers</Path>
+                    </PathAndCredentials>
+"
+        (( idx++ )) || true
+    done
+
+    cat > "$dest" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated by pve-build-windows-template ${VERSION} — do not edit by hand.
+     Build ${BUILD_ID}: Windows Server ${RELEASE} ${SKU} (${CURRENT_EDITION}) -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+    <settings pass="windowsPE">
+
+        <component name="Microsoft-Windows-International-Core-WinPE"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <SetupUILanguage>
+                <UILanguage>${LOCALE}</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>${INPUT_LOCALE}</InputLocale>
+            <SystemLocale>${LOCALE}</SystemLocale>
+            <UILanguage>${LOCALE}</UILanguage>
+            <UserLocale>${LOCALE}</UserLocale>
+        </component>
+
+        <!-- Loads the virtio SCSI driver so Setup can see the disk at all. -->
+        <component name="Microsoft-Windows-PnpCustomizationsWinPE"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <DriverPaths>
+${drive_paths}            </DriverPaths>
+        </component>
+
+        <component name="Microsoft-Windows-Setup"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+            <!-- No Recovery partition: a trailing WinRE partition makes C:
+                 unextendable, which breaks qm resize + ExtendVolumesPlugin. -->
+            <DiskConfiguration>
+                <WillShowUI>OnError</WillShowUI>
+                <Disk wcm:action="add">
+                    <DiskID>0</DiskID>
+                    <WillWipeDisk>true</WillWipeDisk>
+                    <CreatePartitions>
+                        <CreatePartition wcm:action="add">
+                            <Order>1</Order><Type>EFI</Type><Size>260</Size>
+                        </CreatePartition>
+                        <CreatePartition wcm:action="add">
+                            <Order>2</Order><Type>MSR</Type><Size>128</Size>
+                        </CreatePartition>
+                        <CreatePartition wcm:action="add">
+                            <Order>3</Order><Type>Primary</Type><Extend>true</Extend>
+                        </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                        <ModifyPartition wcm:action="add">
+                            <Order>1</Order><PartitionID>1</PartitionID>
+                            <Label>System</Label><Format>FAT32</Format>
+                        </ModifyPartition>
+                        <ModifyPartition wcm:action="add">
+                            <Order>2</Order><PartitionID>2</PartitionID>
+                        </ModifyPartition>
+                        <ModifyPartition wcm:action="add">
+                            <Order>3</Order><PartitionID>3</PartitionID>
+                            <Label>Windows</Label><Letter>C</Letter><Format>NTFS</Format>
+                        </ModifyPartition>
+                    </ModifyPartitions>
+                </Disk>
+            </DiskConfiguration>
+
+            <ImageInstall>
+                <OSImage>
+                    <InstallFrom>
+                        <MetaData wcm:action="add">
+                            <Key>/IMAGE/NAME</Key>
+                            <Value>${IMAGE_NAME}</Value>
+                        </MetaData>
+                    </InstallFrom>
+                    <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>3</PartitionID>
+                    </InstallTo>
+                    <InstallToAvailablePartition>false</InstallToAvailablePartition>
+                    <WillShowUI>OnError</WillShowUI>
+                </OSImage>
+            </ImageInstall>
+
+            <UserData>
+                <AcceptEula>true</AcceptEula>
+                <FullName>${FULLNAME}</FullName>
+                <Organization>${ORGANIZATION}</Organization>
+$(productkey_block)            </UserData>
+
+        </component>
+    </settings>
+
+    <settings pass="specialize">
+
+        <component name="Microsoft-Windows-Shell-Setup"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <ComputerName>*</ComputerName>
+            <TimeZone>${TIMEZONE}</TimeZone>
+$(specialize_productkey_block)
+        </component>
+
+        <!-- Copy the build payload off whichever drive letter the answer ISO
+             landed on, then hand over to a batch file for the rest.
+             Two constraints shape these two commands:
+               * Path is capped at 259 characters (MAX_PATH).  Setup rejects
+                 the whole answer file with a bare "Value is invalid." if it
+                 is exceeded, ~20 minutes into the build, so all real logic
+                 lives in stage.cmd on the answer ISO rather than inline.
+               * PowerShell rather than cmd for the drive scan: a cmd
+                 one-liner needs %d FOR variables, and Setup's own %VAR%
+                 expansion runs over Path before cmd ever sees it.
+                 PowerShell has no percent expansion.
+             Both end in exit 0 — a non-zero RunSynchronousCommand aborts
+             Setup outright, losing every diagnostic, whereas an absent
+             C:\pvebuild is a far more useful signal. -->
+        <component name="Microsoft-Windows-Deployment"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <RunSynchronous>
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Description>Stage pve-build payload</Description>
+                    <Path>${RSC_PATH_1}</Path>
+                    <WillReboot>Never</WillReboot>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <Description>Install SetupComplete hook</Description>
+                    <Path>${RSC_PATH_2}</Path>
+                    <WillReboot>Never</WillReboot>
+                </RunSynchronousCommand>
+            </RunSynchronous>
+        </component>
+    </settings>
+
+    <settings pass="oobeSystem">
+
+        <component name="Microsoft-Windows-International-Core"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <InputLocale>${INPUT_LOCALE}</InputLocale>
+            <SystemLocale>${LOCALE}</SystemLocale>
+            <UILanguage>${LOCALE}</UILanguage>
+            <UserLocale>${LOCALE}</UserLocale>
+        </component>
+
+        <!-- Deliberately no AutoLogon and no FirstLogonCommands: everything
+             runs from SetupComplete.cmd as LocalSystem, so no Administrator
+             profile is ever created.  Profile creation is what makes
+             sysprep /generalize fail on Desktop Experience SKUs. -->
+        <component name="Microsoft-Windows-Shell-Setup"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Work</NetworkLocation>
+                <ProtectYourPC>3</ProtectYourPC>
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
+            </OOBE>
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>${ADMIN_PASSWORD}</Value>
+                    <PlainText>true</PlainText>
+                </AdministratorPassword>
+            </UserAccounts>
+            <TimeZone>${TIMEZONE}</TimeZone>
+        </component>
+    </settings>
+
+</unattend>
+EOF
+    chmod 600 "$dest"
+}
+
+# Invoked from the specialize pass by RunSynchronousCommand Order 2, which
+# can only afford a 259-character Path.  Everything that would have been
+# inline lives here instead.
+generate_stage_cmd() {
+    cat > "${STAGE_DIR}/pvebuild/stage.cmd" <<'EOF'
+@echo off
+rem Staged by pve-build-windows-template — runs in the specialize pass.
+md "%WINDIR%\Setup\Scripts" 2>nul
+copy /Y "%SystemDrive%\pvebuild\SetupComplete.cmd" "%WINDIR%\Setup\Scripts\" >nul
+copy /Y "%SystemDrive%\pvebuild\pve-sysprep.xml"   "%WINDIR%\Setup\Scripts\" >nul
+exit /b 0
+EOF
+}
+
+# Runs as LocalSystem after Setup finishes but before the logon screen.
+# Only a launcher: the real work is in setup-complete.ps1, because every
+# installer here needs a hard timeout and batch has no sane way to express
+# one.  Windows only recognises SetupComplete.cmd, hence the two files.
+generate_setupcomplete_cmd() {
+    cat > "${STAGE_DIR}/pvebuild/SetupComplete.cmd" <<'EOF'
+@echo off
+rem Staged by pve-build-windows-template. Runs as LocalSystem, post-Setup,
+rem pre-logon. All logic lives in setup-complete.ps1.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SystemDrive%\pvebuild\setup-complete.ps1"
+exit /b 0
+EOF
+}
+
+# Installs every in-guest payload, then schedules sysprep for the NEXT boot:
+# MSI installs leave PendingFileRenameOperations behind and sysprep
+# /generalize refuses to run while a reboot is pending.
+#
+# Every installer is bounded by RunTimed().  spice-guest-tools in particular
+# has been observed hanging indefinitely under /S — it is an NSIS bundle and
+# the QXL WDDM driver it carries has no INF for Server 2022/2025.  Its
+# outcome is advisory (the vdagent service is what we want), so a hang must
+# degrade to SPICE-WARN rather than silently consuming the whole payload
+# budget and failing the build.
+generate_setupcomplete_ps1() {
+    cat > "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
+# Generated by pve-build-windows-template — runs as LocalSystem before logon.
+$ErrorActionPreference = 'Continue'
+$PL  = Join-Path $env:SystemDrive 'pvebuild'
+$LOG = Join-Path $PL 'state.txt'
+
+function Mark([string]$s) { Add-Content -LiteralPath $LOG -Value $s }
+
+# Returns the process exit code, or -1 if it had to be killed on timeout.
+function RunTimed([string]$file, [string[]]$argv, [int]$sec) {
+    try {
+        $p = Start-Process -FilePath $file -ArgumentList $argv -PassThru -WindowStyle Hidden
+    } catch {
+        return -2
+    }
+    if (-not $p.WaitForExit($sec * 1000)) {
+        try { $p.Kill() } catch { }
+        return -1
+    }
+    # Second, argument-less wait so ExitCode is populated (documented quirk).
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
+Mark 'STARTED'
+
+# Wait until Setup has released the machine.
+for ($i = 0; $i -lt 120; $i++) {
+    $v = (Get-ItemProperty 'HKLM:\SYSTEM\Setup' -Name SystemSetupInProgress `
+          -ErrorAction SilentlyContinue).SystemSetupInProgress
+    if ($null -eq $v -or $v -eq 0) { break }
+    Start-Sleep -Seconds 5
+}
+Mark 'SETUP-IDLE'
+
+if (Test-Path -LiteralPath "$PL\virtio-win-gt-x64.msi") {
+    $rc = RunTimed 'msiexec.exe' @('/i', "$PL\virtio-win-gt-x64.msi", '/qn',
+                                   '/norestart', '/l*v', "$PL\virtio.log") 900
+    Mark $(if ($rc -eq 0) { 'VIRTIO-OK' } else { "VIRTIO-FAIL($rc)" })
+} else {
+    Mark 'VIRTIO-SKIP'
+}
+
+$rc = RunTimed 'msiexec.exe' @('/i', "$PL\qemu-ga-x86_64.msi", '/qn',
+                               '/norestart', '/l*v', "$PL\qemuga.log") 900
+Mark $(if ($rc -eq 0) { 'QEMUGA-OK' } else { "QEMUGA-FAIL($rc)" })
+& sc.exe config QEMU-GA start= auto | Out-Null
+Start-Service QEMU-GA -ErrorAction SilentlyContinue
+
+# Advisory — see the comment on generate_setupcomplete_ps1.
+$rc = RunTimed "$PL\spice-guest-tools.exe" @('/S') 300
+Mark $(if ($rc -eq 0) { 'SPICE-OK' } else { "SPICE-WARN($rc)" })
+
+$rc = RunTimed 'msiexec.exe' @('/i', "$PL\CloudbaseInitSetup_x64.msi", '/qn',
+                               '/norestart', 'RUN_SERVICE_AS_LOCAL_SYSTEM=1',
+                               '/l*v', "$PL\cloudbase.log") 900
+Mark $(if ($rc -eq 0) { 'CBI-OK' } else { "CBI-FAIL($rc)" })
+
+$conf = Join-Path $env:ProgramFiles 'Cloudbase Solutions\Cloudbase-Init\conf'
+if (Test-Path -LiteralPath $conf) {
+    Copy-Item "$PL\cloudbase-init.conf", "$PL\cloudbase-init-unattend.conf" `
+              $conf -Force
+    Mark 'CBI-CONF-OK'
+} else {
+    Mark 'CBI-CONF-FAIL'
+}
+
+Mark 'INSTALLS-DONE'
+
+# Reboot first, then sysprep from a clean boot with no pending renames.
+$scripts = Join-Path $env:windir 'Setup\Scripts'
+Copy-Item "$PL\sysprep.cmd" (Join-Path $scripts 'sysprep.cmd') -Force
+& schtasks.exe /create /tn PVESysprep /sc onstart /ru SYSTEM /rl HIGHEST `
+    /tr "$scripts\sysprep.cmd" /f | Out-Null
+& shutdown.exe /r /t 5 /c 'pve-build-windows-template: reboot before sysprep'
+exit 0
+EOF
+}
+
+generate_sysprep_cmd() {
+    cat > "${STAGE_DIR}/pvebuild/sysprep.cmd" <<'EOF'
+@echo off
+setlocal enableextensions
+set PL=%SystemDrive%\pvebuild
+set LOG=%PL%\state.txt
+
+schtasks /delete /tn PVESysprep /f >nul 2>&1
+
+rem CRITICAL: SetupComplete.cmd survives /generalize, and Windows runs it
+rem again at OOBE on every clone.  Left in place, each clone re-runs the whole
+rem payload sequence (failing, because the installers were deleted below),
+rem then re-syspreps and powers itself off — the template boots once and dies.
+rem Remove it here, on the boot before sysprep, so it is gone from the sealed
+rem image.  Safe to delete from this script: SetupComplete.cmd finished
+rem executing on the previous boot.
+del /f /q "%WINDIR%\Setup\Scripts\SetupComplete.cmd" >nul 2>&1
+del /f /q "%PL%\setup-complete.ps1" >nul 2>&1
+
+rem Cloudbase-Init records which plugins already ran; that state survives
+rem generalize and would suppress them on a clone whose config hashes the
+rem same.  Drop it so every clone is provisioned from scratch.
+reg delete "HKLM\SOFTWARE\Cloudbase Solutions\Cloudbase-Init" /f >nul 2>&1
+
+rem Setup scrubs secrets per pass, but be explicit — this file held the
+rem administrator password and any product key.
+del /f /q "%WINDIR%\Panther\unattend.xml" >nul 2>&1
+
+rem Keep state.txt and the *.log files for post-mortem; drop the installers.
+del /f /q "%PL%\*.msi" "%PL%\*.exe" "%PL%\*.conf" >nul 2>&1
+
+echo SYSPREP-LAUNCH >> "%LOG%"
+
+"%WINDIR%\System32\Sysprep\sysprep.exe" /generalize /oobe /shutdown ^
+    /unattend:"%WINDIR%\Setup\Scripts\pve-sysprep.xml"
+exit /b 0
+EOF
+}
+
+# Our own sysprep answer file.  Based on the one the Cloudbase-Init installer
+# ships (conf/Unattend.xml) — we keep PersistAllDeviceInstalls (preserves the
+# virtio driver bindings across generalize) and the cloudbase-init-unattend
+# specialize hook, and add the administrator password, timezone, locales and
+# SkipRearm that the upstream file omits.  Without the password block a clone
+# can land on an OOBE password screen.
+generate_sysprep_unattend() {
+    local dest="${STAGE_DIR}/pvebuild/pve-sysprep.xml"
+    cat > "$dest" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated by pve-build-windows-template ${VERSION} -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+    <settings pass="generalize">
+        <component name="Microsoft-Windows-PnpSysprep"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS">
+            <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+            <DoNotCleanUpNonPresentDevices>true</DoNotCleanUpNonPresentDevices>
+        </component>
+        <component name="Microsoft-Windows-Security-SPP"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS">
+            <SkipRearm>1</SkipRearm>
+        </component>
+    </settings>
+
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-Deployment"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS"
+                   xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <!-- Verbatim from the Cloudbase-Init installer's own Unattend.xml.
+                 218 characters, so comfortably inside the 259-character
+                 RunSynchronousCommand/Path cap; it is constant, so unlike the
+                 Autounattend paths it needs no length guard. -->
+            <RunSynchronous>
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Description>Cloudbase-Init specialize</Description>
+                    <Path>cmd.exe /c ""%ProgramFiles%\Cloudbase Solutions\Cloudbase-Init\Python\Scripts\cloudbase-init.exe" --config-file "%ProgramFiles%\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init-unattend.conf" &amp;&amp; exit 1 || exit 2"</Path>
+                    <WillReboot>OnRequest</WillReboot>
+                </RunSynchronousCommand>
+                <!-- This file carries the Administrator password in cleartext
+                     and would otherwise sit on every clone forever.  Sysprep
+                     has already copied it to Panther\unattend.xml (where
+                     Windows scrubs the sensitive values), so the original is
+                     no longer needed once specialize has run. -->
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <Description>Remove staged build scripts</Description>
+                    <Path>cmd.exe /c del /f /q "%WINDIR%\Setup\Scripts\pve-sysprep.xml" "%WINDIR%\Setup\Scripts\sysprep.cmd" &amp; ver &gt;nul</Path>
+                    <WillReboot>Never</WillReboot>
+                </RunSynchronousCommand>
+            </RunSynchronous>
+        </component>
+    </settings>
+
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS">
+            <InputLocale>${INPUT_LOCALE}</InputLocale>
+            <SystemLocale>${LOCALE}</SystemLocale>
+            <UILanguage>${LOCALE}</UILanguage>
+            <UserLocale>${LOCALE}</UserLocale>
+        </component>
+        <component name="Microsoft-Windows-Shell-Setup"
+                   processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+                   language="neutral" versionScope="nonSxS">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Work</NetworkLocation>
+                <ProtectYourPC>3</ProtectYourPC>
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
+            </OOBE>
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>${ADMIN_PASSWORD}</Value>
+                    <PlainText>true</PlainText>
+                </AdministratorPassword>
+            </UserAccounts>
+            <TimeZone>${TIMEZONE}</TimeZone>
+        </component>
+    </settings>
+
+</unattend>
+EOF
+    chmod 600 "$dest"
+}
+
+# PVE presents cloud-init to Windows guests as an OpenStack config-drive
+# (get_cloudinit_format() returns configdrive2 for any Windows ostype), so
+# ConfigDriveService is the correct datasource — not NoCloud.
+#
+# UserDataPlugin is MANDATORY: PVE's cloudbase_configdrive2_metadata() emits
+# only uuid, network_config, admin_pass and public_keys — there is no
+# hostname key in meta_data.json (cloudbase-init issue #155).  The hostname
+# arrives inside user_data as cloud-config, so the chain is
+# UserDataPlugin -> cloudconfig -> set_hostname.  Drop UserDataPlugin and
+# `qm set <id> --name` silently stops working.
+generate_cloudbase_conf() {
+    local dest="${STAGE_DIR}/pvebuild/cloudbase-init.conf"
+    cat > "$dest" <<EOF
+# Generated by pve-build-windows-template ${VERSION}
+[DEFAULT]
+username=${CI_USERNAME}
+groups=Administrators
+inject_user_password=true
+first_logon_behaviour=no
+rename_admin_user=false
+bsdtar_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\bsdtar.exe
+mtools_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\
+verbose=true
+debug=true
+logdir=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\log\\
+logfile=cloudbase-init.log
+default_log_levels=comtypes=INFO,suds=INFO,iso8601=WARN,requests=WARN
+local_scripts_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\LocalScripts\\
+check_latest_version=false
+allow_reboot=false
+stop_service_on_exit=false
+
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+
+plugins=cloudbaseinit.plugins.common.mtu.MTUPlugin,
+        cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin,
+        cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,
+        cloudbaseinit.plugins.windows.createuser.CreateUserPlugin,
+        cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin,
+        cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin,
+        cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,
+        cloudbaseinit.plugins.common.userdata.UserDataPlugin,
+        cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin
+
+[config_drive]
+types=iso
+locations=cdrom
+EOF
+
+    dest="${STAGE_DIR}/pvebuild/cloudbase-init-unattend.conf"
+    cat > "$dest" <<EOF
+# Generated by pve-build-windows-template ${VERSION}
+# Runs from the sysprep specialize pass, so the hostname rename reboot is
+# folded into Setup rather than costing an extra boot on the clone.
+[DEFAULT]
+username=${CI_USERNAME}
+groups=Administrators
+inject_user_password=true
+first_logon_behaviour=no
+rename_admin_user=false
+bsdtar_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\bsdtar.exe
+mtools_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\
+verbose=true
+debug=true
+logdir=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\log\\
+logfile=cloudbase-init-unattend.log
+default_log_levels=comtypes=INFO,suds=INFO,iso8601=WARN,requests=WARN
+check_latest_version=false
+allow_reboot=true
+stop_service_on_exit=false
+
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+
+plugins=cloudbaseinit.plugins.common.mtu.MTUPlugin,
+        cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin,
+        cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,
+        cloudbaseinit.plugins.common.userdata.UserDataPlugin
+
+[config_drive]
+types=iso
+locations=cdrom
+EOF
+}
+
+build_answer_iso() {
+    local out="${ISO_DIR}/pve-answer-${BUILD_ID}-${CURRENT_EDITION}.iso"
+    local tool
+    tool=$(iso_authoring_tool)
+
+    # -joliet-long is required: CloudbaseInitSetup_1_1_8_x64.msi exceeds the
+    # 64-character Joliet default.  No UDF — the payload is well under 4 GB
+    # and genisoimage's UDF support is documented as pitfall-ridden.
+    run_secret "${tool} -o ${out} <staged answer files>" \
+        "$tool" -quiet -iso-level 3 -J -joliet-long -rational-rock \
+            -input-charset utf-8 -V "PVEBUILD" \
+            -volset "pve-build-windows-template ${VERSION}" \
+            -o "$out" "${STAGE_DIR}/"
+
+    ANSWER_ISO_PATH="$out"
+    (( DRY_RUN )) || ok "Answer ISO: $(basename "$out") ($(du -h "$out" | cut -f1))"
+}
+
+# --- Build VM -----------------------------------------------------------------
+
+create_build_vm() {
+    local vmid="$1"
+    local ostype net0 efi_opts
+    ostype=$(release_ostype "$RELEASE")
+
+    net0="virtio,bridge=${BUILD_BRIDGE},firewall=1"
+    efi_opts="${STORAGE}:0,efitype=4m"
+    (( USE_SECUREBOOT )) && efi_opts+=",pre-enrolled-keys=1" || efi_opts+=",pre-enrolled-keys=0"
+
+    msg "Creating build VM ${vmid} (${ostype}, ${BUILD_CORES} cores, ${BUILD_MEMORY} MB)"
+
+    run qm create "$vmid" --name "pve-winbuild-${vmid}-${RELEASE}" \
+        --ostype "$ostype" --machine q35 --bios ovmf \
+        --cpu "cputype=${CPU_TYPE}" \
+        --sockets 1 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
+        --scsihw virtio-scsi-single --agent enabled=1 \
+        --net0 "$net0" --vga "$VGA" --localtime 0
+
+    BUILD_VMID="$vmid"
+
+    run qm set "$vmid" --efidisk0 "$efi_opts"
+    (( USE_TPM )) && run qm set "$vmid" --tpmstate0 "${STORAGE}:0,version=v2.0"
+    run qm set "$vmid" --scsi0 "${STORAGE}:${DISK_SIZE},discard=on,ssd=1,iothread=1"
+
+    # ide2 is deliberately left free for the cloud-init drive at seal time.
+    run qm set "$vmid" --ide0  "$(iso_attach_ref "$WIN_ISO_PATH"),media=cdrom"
+    run qm set "$vmid" --sata0 "$(iso_attach_ref "$VIRTIO_ISO_PATH"),media=cdrom"
+    run qm set "$vmid" --sata1 "$(iso_attach_ref "$ANSWER_ISO_PATH"),media=cdrom"
+    run qm set "$vmid" --boot "order=scsi0;ide0"
+}
+
+# Microsoft UEFI install media prints "Press any key to boot from CD or
+# DVD......" and, if nothing is pressed within a few seconds, falls through to
+# "No bootable option or device was found" — the build then sits there until
+# the install timeout expires.  There is no unattend setting for this: the
+# prompt lives in efisys.bin on the media, and the no-prompt variant would
+# mean remastering the 5 GB Windows ISO.
+#
+# Sending Enter through the QEMU monitor for the first minute is the cheap
+# fix.  It is safe because the install is fully unattended, so there is no
+# dialog for a stray Enter to act on; and because --boot order=scsi0;ide0
+# means every later boot goes straight to the now-bootable disk, so the
+# prompt never appears again and Setup cannot be restarted by accident.
+press_boot_prompt() {
+    local vmid="$1" i
+    msg "Answering the boot-from-CD prompt"
+    for (( i = 0; i < 30; i++ )); do
+        echo "sendkey ret" | qm monitor "$vmid" >/dev/null 2>&1 || true
+        sleep 2
+    done
+}
+
+# Poll the QEMU guest agent until it responds or timeout.
+wait_for_agent() {
+    local vmid="$1" timeout="$2"
+    local elapsed=0
+    while (( elapsed < timeout )); do
+        qm guest cmd "$vmid" ping &>/dev/null && return 0
+        sleep 15
+        (( elapsed += 15 ))
+        (( elapsed % 300 )) || ok "  still installing... (${elapsed}s / ${timeout}s)"
+    done
+    return 1
+}
+
+# Read a file from the guest via the agent.  Returns empty on any failure.
+guest_read() {
+    local vmid="$1" path="$2" result
+    result=$(qm guest exec "$vmid" --timeout 30 -- cmd.exe /c type "$path" 2>/dev/null) || return 1
+    python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.stdout.write(d.get("out-data", ""))
+' <<< "$result"
+}
+
+# Follow C:\pvebuild\state.txt until the guest reports INSTALLS-DONE.
+wait_for_payloads() {
+    local vmid="$1" timeout="$2"
+    local elapsed=0 state seen=""
+
+    while (( elapsed < timeout )); do
+        state=$(guest_read "$vmid" 'C:\pvebuild\state.txt' 2>/dev/null || true)
+        if [[ -n "$state" ]]; then
+            local line
+            while IFS= read -r line; do
+                line="${line//$'\r'/}"
+                [[ -z "$line" ]] && continue
+                [[ "$seen" == *"|${line}|"* ]] && continue
+                seen+="|${line}|"
+                # Failure markers carry the exit code, e.g. VIRTIO-FAIL(1603)
+                # or SPICE-WARN(-1) for a timeout kill.
+                case "$line" in
+                    *FAIL*) warn "  guest: ${line}" ;;
+                    *WARN*) warn "  guest: ${line}" ;;
+                    *SKIP*) warn "  guest: ${line}" ;;
+                    *)      ok   "  guest: ${line}" ;;
+                esac
+            done <<< "$state"
+            if grep -q '^INSTALLS-DONE' <<< "${state//$'\r'/}"; then
+                GUEST_STATE="${state//$'\r'/}"
+                return 0
+            fi
+        fi
+        sleep 15
+        (( elapsed += 15 ))
+    done
+    return 1
+}
+
+# INSTALLS-DONE only means the sequence ran to the end, not that every step
+# worked.  SPICE is advisory; the rest are not — a template without the guest
+# agent or without Cloudbase-Init is not the thing the operator asked for.
+check_payload_failures() {
+    local marker
+    for marker in VIRTIO-FAIL QEMUGA-FAIL CBI-FAIL CBI-CONF-FAIL; do
+        if grep -q "^${marker}" <<< "$GUEST_STATE"; then
+            err "In-guest step failed: $(grep "^${marker}" <<< "$GUEST_STATE" | head -1)"
+            die "Payload installation reported ${marker}. The per-installer log is on the build disk under C:\\pvebuild\\*.log — re-run with --keep-on-failure to read it."
+        fi
+    done
+    if grep -q '^SPICE-WARN' <<< "$GUEST_STATE"; then
+        warn "spice-guest-tools did not install cleanly ($(grep '^SPICE-WARN' <<< "$GUEST_STATE" | head -1)) — continuing, the SPICE agent is advisory"
+    fi
+}
+
+wait_for_shutdown() {
+    local vmid="$1" timeout="$2"
+    local elapsed=0 st
+    while (( elapsed < timeout )); do
+        st=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || true
+        [[ "$st" == "stopped" ]] && return 0
+        sleep 15
+        (( elapsed += 15 ))
+        (( elapsed % 300 )) || ok "  sysprep running... (${elapsed}s / ${timeout}s)"
+    done
+    return 1
+}
+
+# Resolve a VM's OS disk to a host path for offline inspection.
+vm_disk_path() {
+    local vmid="$1" ref
+    ref=$(qm config "$vmid" 2>/dev/null | sed -n 's/^scsi0: \([^,]*\).*/\1/p')
+    [[ -n "$ref" ]] || return 1
+    pvesm path "$ref" 2>/dev/null
+}
+
+# Read a file out of the stopped guest's disk.
+#
+# Drive letters are deliberately NOT used.  `sysprep /generalize` clears the
+# MountedDevices registry data that libguestfs needs to map C:, so after a
+# successful sysprep `virt-cat -a disk 'C:\...'` fails with "to use Windows
+# drive letters, this must be a Windows guest" — on a perfectly good image.
+# Verifying a generalized image therefore has to go through filesystem paths
+# via guestfish -i, which mounts the inspected Windows root at /.
+guest_disk_cat() {
+    local disk="$1" path="$2"
+    guestfish --ro -a "$disk" -i cat "$path" 2>/dev/null
+}
+
+guest_disk_ls() {
+    local disk="$1" path="$2"
+    guestfish --ro -a "$disk" -i ls "$path" 2>/dev/null
+}
+
+# A stopped VM proves nothing on its own — verify offline that sysprep
+# actually generalized the image.
+verify_sysprep() {
+    local vmid="$1" disk
+    disk=$(vm_disk_path "$vmid") || die "Cannot resolve the OS disk of VM ${vmid}"
+
+    guest_disk_ls "$disk" '/Windows/System32/Sysprep' \
+        | grep -qix 'Sysprep_succeeded.tag' || \
+        die "Sysprep_succeeded.tag missing — sysprep did not complete (re-run with --keep-on-failure to inspect VM ${vmid})"
+
+    guest_disk_cat "$disk" '/pvebuild/state.txt' \
+        | grep -q 'SYSPREP-LAUNCH' || \
+        die "SYSPREP-LAUNCH marker missing from state.txt — the build did not reach sysprep"
+
+    ok "Sysprep verified (Sysprep_succeeded.tag + SYSPREP-LAUNCH)"
+}
+
+# Pull everything useful off the disk before the VM is destroyed.
+dump_failure_diagnostics() {
+    local vmid="$1" disk f
+    disk=$(vm_disk_path "$vmid" 2>/dev/null) || return 0
+    [[ -n "$disk" && -e "$disk" ]] || return 0
+
+    warn "Collecting diagnostics from VM ${vmid}..."
+    qm stop "$vmid" --timeout 30 2>/dev/null || true
+    wait_stopped "$vmid" 60 || true
+
+    # Filesystem paths, not drive letters — see guest_disk_cat().
+    echo "----- pvebuild\\state.txt -----" >&2
+    guest_disk_cat "$disk" '/pvebuild/state.txt' | tail -40 >&2 || \
+        echo "(absent — the build never reached SetupComplete.cmd)" >&2
+
+    for f in '/Windows/Panther/setuperr.log' \
+             '/Windows/Panther/setupact.log' \
+             '/Windows/Panther/UnattendGC/setupact.log' \
+             '/Windows/System32/Sysprep/Panther/setupact.log' \
+             '/pvebuild/cloudbase.log'; do
+        echo "----- ${f} (tail) -----" >&2
+        guest_disk_cat "$disk" "$f" | tail -30 | redact >&2 || \
+            echo "(absent)" >&2
+    done
+}
+
+# --- Sealing ------------------------------------------------------------------
+
+build_notes() {
+    cat <<EOF
+Built by pve-build-windows-template ${VERSION} on $(hostname) at $(date -Is)
+
+  Release        : Windows Server ${RELEASE} ($( (( IS_EVAL_MEDIA )) && echo evaluation || echo licensed ) media)
+  SKU / edition  : ${SKU} / ${CURRENT_EDITION}
+  WIM image      : ${IMAGE_NAME}
+  Source ISO     : $(basename "$WIN_ISO_PATH")
+  virtio-win     : ${VIRTIO_VERSION}
+  Cloudbase-Init : $(basename "$CLOUDBASE_MSI_PATH")
+  SPICE tools    : $(basename "$SPICE_EXE_PATH")
+  Activation     : $( (( USE_KMS )) && echo "KMS (GVLK)" || { [[ -n "$PRODUCT_KEY" ]] && echo "operator-supplied product key" || echo "none - deferred activation"; } )
+
+Cloning:
+  qm clone <this> <newid> --name myhost --full
+  qm set <newid> --ipconfig0 ip=A.B.C.D/NN,gw=A.B.C.1 --nameserver A.B.C.1
+  qm set <newid> --cipassword 'secret' --sshkeys ~/.ssh/id_ed25519.pub
+
+Note: --ciuser is a no-op on Windows. The managed account is '${CI_USERNAME}',
+fixed at build time; --cipassword sets its password. Single NIC only.
+EOF
+}
+
+seal_template() {
+    local vmid="$1" tpl_name="$2"
+
+    msg "Sealing template ${tpl_name} (VMID ${vmid})"
+
+    run qm set "$vmid" --delete ide0,sata0,sata1
+    run qm set "$vmid" --ide2 "${STORAGE}:cloudinit"
+    run qm set "$vmid" --citype configdrive2
+    run qm set "$vmid" --ciupgrade 0 2>/dev/null || true
+    run qm set "$vmid" --boot "order=scsi0"
+    run qm set "$vmid" --cores "$CORES" --memory "$MEMORY" --name "$tpl_name"
+
+    local net0="virtio,bridge=${BRIDGE},firewall=1"
+    [[ -n "$VLAN" ]] && net0+=",tag=${VLAN}"
+    run qm set "$vmid" --net0 "$net0"
+
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm set ${vmid} --description <build notes>"
+    else
+        qm set "$vmid" --description "$(build_notes)"
+    fi
+
+    run qm template "$vmid"
+    BUILD_VMID=""
+    ok "Template ready: ${tpl_name} (VMID ${vmid})"
+}
+
+# --- Orchestration ------------------------------------------------------------
+
+# Build one template for one edition.
+build_one() {
+    local edition="$1" vmid="$2"
+    CURRENT_EDITION="$edition"
+
+    echo
+    msg "${C_BOLD}=== Windows Server ${RELEASE} ${SKU} ${edition} → VMID ${vmid} ===${C_RESET}"
+
+    if vmid_exists "$vmid"; then
+        if (( FORCE )); then
+            warn "VMID ${vmid} exists — destroying (--force)"
+            run qm destroy "$vmid" --purge 2>/dev/null || true
+        else
+            warn "VMID ${vmid} exists — skipping (use --force to replace)"
+            (( SKIPPED++ )) || true
+            return 0
+        fi
+    fi
+
+    # ---- pick the image and stage the answer media ---------------------------
+    # A dry run against a node that has not downloaded the media yet can only
+    # report the plan — there is nothing to inspect or stage.
+    if (( DRY_RUN )) && [[ ! -f "$WIN_ISO_PATH" || ! -f "$VIRTIO_ISO_PATH" ]]; then
+        IMAGE_NAME="Windows Server ${RELEASE} $(image_name_suffix "$SKU" "$edition")"
+        warn "Media not present locally — showing the plan only"
+        ok "Would install image: ${IMAGE_NAME}"
+        ANSWER_ISO_PATH="${ISO_DIR}/pve-answer-${BUILD_ID}-${CURRENT_EDITION}.iso"
+        create_build_vm "$vmid"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm start ${vmid}"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} wait for install / payloads / sysprep"
+        BUILD_VMID=""
+        seal_template "$vmid" "$(template_name "$edition")"
+        ANSWER_ISO_PATH=""
+        return 0
+    fi
+
+    # The Windows media was probed once in main(); WIM_NAMES is cached, so a
+    # two-edition run does not mount the 5 GB ISO twice.
+    local virtio_mnt
+    select_image_name "$edition"
+
+    mount_iso "$VIRTIO_ISO_PATH"; virtio_mnt="$MNT"
+    probe_virtio_iso "$virtio_mnt"
+
+    STAGE_DIR=$(mktemp -d /tmp/pve-winbuild-stage-XXXXXX)
+    chmod 700 "$STAGE_DIR"
+
+    msg "Generating answer media"
+    stage_drivers "$virtio_mnt"
+    stage_payloads "$virtio_mnt"
+    generate_autounattend
+    generate_stage_cmd
+    generate_setupcomplete_cmd
+    generate_setupcomplete_ps1
+    generate_sysprep_cmd
+    generate_sysprep_unattend
+    generate_cloudbase_conf
+    build_answer_iso
+
+    umount_isos
+
+    if (( SHOW_ANSWER_FILE )); then
+        echo "----- Autounattend.xml (redacted) -----"
+        redact < "${STAGE_DIR}/Autounattend.xml"
+        echo "---------------------------------------"
+    fi
+
+    # ---- run the build -------------------------------------------------------
+    create_build_vm "$vmid"
+
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm start ${vmid}"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} wait for install / payloads / sysprep"
+        BUILD_VMID=""
+        seal_template "$vmid" "$(template_name "$edition")"
+        rm -rf "$STAGE_DIR"; STAGE_DIR=""
+        return 0
+    fi
+
+    run qm start "$vmid"
+    press_boot_prompt "$vmid"
+
+    msg "Waiting for Windows Setup to finish (timeout ${INSTALL_TIMEOUT}s)"
+    wait_for_agent "$vmid" "$INSTALL_TIMEOUT" || \
+        die "The guest agent never answered. Two causes account for almost every occurrence:
+       (a) the virtio SCSI driver was not loaded in WinPE, leaving Setup stuck
+           at disk selection with no disks listed — check the \\drivers letter
+           enumeration in Autounattend.xml and C:\\Windows\\Panther\\setupact.log;
+       (b) the specialize pass could not find the answer ISO, so C:\\pvebuild
+           and SetupComplete.cmd were never staged.
+       Re-run with --keep-on-failure and inspect VM ${vmid}."
+    ok "Guest agent is up"
+
+    msg "Installing in-guest payloads (timeout ${PAYLOAD_TIMEOUT}s)"
+    wait_for_payloads "$vmid" "$PAYLOAD_TIMEOUT" || \
+        die "Payload installation did not reach INSTALLS-DONE within ${PAYLOAD_TIMEOUT}s (raise --payload-timeout, or re-run with --keep-on-failure and read C:\\pvebuild\\state.txt)"
+    check_payload_failures
+
+    msg "Waiting for sysprep to generalize and power off (timeout ${SYSPREP_TIMEOUT}s)"
+    wait_for_shutdown "$vmid" "$SYSPREP_TIMEOUT" || \
+        die "VM ${vmid} did not power off within ${SYSPREP_TIMEOUT}s"
+    ok "VM powered off"
+
+    verify_sysprep "$vmid"
+    seal_template "$vmid" "$(template_name "$edition")"
+
+    # The answer ISO carries the administrator password and any product key in
+    # cleartext, so it goes unless the operator explicitly asked to keep it.
+    if (( KEEP_ANSWER_ISO )); then
+        warn "Keeping ${ANSWER_ISO_PATH} — it contains the administrator password in cleartext"
+    else
+        rm -f "$ANSWER_ISO_PATH"
+    fi
+    ANSWER_ISO_PATH=""
+    rm -rf "$STAGE_DIR"; STAGE_DIR=""
+}
+
+# ci-win2022-std-core-202608011530.x86-64 — matches the existing ci-* naming
+# and is a valid DNS label (PVE VM names must be).
+template_name() {
+    local edition="$1" sku_short
+    case "$SKU" in
+        standard)   sku_short="std" ;;
+        datacenter) sku_short="dc"  ;;
+    esac
+    echo "ci-win${RELEASE}-${sku_short}-${edition}-${TIMESTAMP}.x86-64"
+}
+
+# --- Remote mode (delegation) -------------------------------------------------
+
+# Copy the script to the target PVE node and re-execute it there in local
+# mode.  Unlike pve-create-tshoot-image nothing is downloaded back — the
+# template stays on the node.  Secrets travel as mode-0600 files so they
+# never appear in the remote process table.
+delegate_to_server() {
+    msg "Remote mode: delegating to ${PVE_SERVER}..."
+
+    [[ -f "$0" ]] || die "--server requires running from a script file, not a pipe"
+
+    local -a ssh_opts=( -o BatchMode=yes -o StrictHostKeyChecking=accept-new )
+
+    local rdir
+    rdir=$(ssh "${ssh_opts[@]}" "$PVE_SERVER" "mktemp -d /tmp/pve-winbuild-XXXXXX") || \
+        die "Cannot create working directory on ${PVE_SERVER}"
+
+    scp -q "${ssh_opts[@]}" "$0" "${PVE_SERVER}:${rdir}/pve-build-windows-template"
+
+    # Build the remote invocation without -S/--mode, to avoid re-delegating.
+    local -a rcmd=( bash "${rdir}/pve-build-windows-template" )
+    [[ -n "$WIN_ISO" ]]      && rcmd+=( --iso "$WIN_ISO" )
+    [[ -n "$EVAL_RELEASE" ]] && rcmd+=( --eval "$EVAL_RELEASE" )
+    [[ -n "$RELEASE" ]]      && rcmd+=( --release "$RELEASE" )
+    rcmd+=( --edition "$EDITION" --sku "$SKU" )
+    rcmd+=( --storage "$STORAGE" )
+    [[ -n "$ISO_STORAGE" ]]  && rcmd+=( --iso-storage "$ISO_STORAGE" )
+    rcmd+=( --start-id "$START_ID" --bridge "$BRIDGE" )
+    [[ -n "$VLAN" ]]         && rcmd+=( --vlan "$VLAN" )
+    [[ -n "$BUILD_BRIDGE" ]] && rcmd+=( --build-bridge "$BUILD_BRIDGE" )
+    rcmd+=( --disk-size "$DISK_SIZE" --cpu-type "$CPU_TYPE" )
+    rcmd+=( --cores "$CORES" --memory "$MEMORY" )
+    rcmd+=( --build-cores "$BUILD_CORES" --build-memory "$BUILD_MEMORY" )
+    rcmd+=( --vga "$VGA" --locale "$LOCALE" --timezone "$TIMEZONE" )
+    rcmd+=( --ci-username "$CI_USERNAME" )
+    rcmd+=( --install-timeout "$INSTALL_TIMEOUT" )
+    rcmd+=( --payload-timeout "$PAYLOAD_TIMEOUT" )
+    rcmd+=( --sysprep-timeout "$SYSPREP_TIMEOUT" )
+    [[ -n "$VIRTIO_ISO" ]]    && rcmd+=( --virtio-iso "$VIRTIO_ISO" )
+    [[ -n "$CLOUDBASE_MSI" ]] && rcmd+=( --cloudbase-msi "$CLOUDBASE_MSI" )
+    [[ -n "$SPICE_EXE" ]]     && rcmd+=( --spice-exe "$SPICE_EXE" )
+    [[ -n "$CACHE_DIR" ]]     && rcmd+=( --cache-dir "$CACHE_DIR" )
+    (( USE_KMS ))          && rcmd+=( --kms )
+    (( USE_TPM ))          || rcmd+=( --no-tpm )
+    (( USE_SECUREBOOT ))   || rcmd+=( --no-secureboot )
+    (( REFRESH_CACHE ))    && rcmd+=( --refresh-cache )
+    (( KEEP_ANSWER_ISO ))  && rcmd+=( --keep-answer-iso )
+    (( KEEP_ON_FAILURE ))  && rcmd+=( --keep-on-failure )
+    (( FORCE ))            && rcmd+=( --force )
+    (( DRY_RUN ))          && rcmd+=( --dry-run )
+
+    # Secrets go as files, never as arguments.
+    if [[ -n "$PRODUCT_KEY" ]]; then
+        printf '%s' "$PRODUCT_KEY" | ssh "${ssh_opts[@]}" "$PVE_SERVER" \
+            "umask 077; cat > ${rdir}/product.key"
+        rcmd+=( --product-key-file "${rdir}/product.key" )
+    fi
+    if [[ -n "$ADMIN_PASSWORD" ]]; then
+        printf '%s' "$ADMIN_PASSWORD" | ssh "${ssh_opts[@]}" "$PVE_SERVER" \
+            "umask 077; cat > ${rdir}/admin.pw"
+        rcmd+=( --admin-password-file "${rdir}/admin.pw" )
+    fi
+
+    local -a tty_flag=()
+    [[ -t 1 ]] && tty_flag=( -t )
+
+    local rc=0
+    ssh "${ssh_opts[@]}" "${tty_flag[@]}" "$PVE_SERVER" "${rcmd[@]}" || rc=$?
+
+    ssh "${ssh_opts[@]}" "$PVE_SERVER" "rm -rf ${rdir}" 2>/dev/null || true
+    return $rc
+}
+
+# --- Usage / help -------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Build sysprepped, cloud-init-capable Windows Server templates on Proxmox VE
+in one non-interactive run.  Produces a Server Core and a Desktop Experience
+template by default.
+
+${C_BOLD}Modes of operation:${C_RESET}
+
+  LOCAL   Run directly on a PVE node (as root).
+  REMOTE  Run from a jump host and give the node with -S.  The script copies
+          itself there and re-executes; the template stays on the node.
+          Paths (--iso, --cache-dir) are interpreted REMOTELY.
+
+${C_BOLD}Media${C_RESET} (Windows media is never downloaded unless you ask for --eval):
+  -i, --iso PATH           Windows ISO — path or STORAGE:iso/NAME
+      --eval RELEASE       Download the Microsoft 180-day evaluation ISO
+                           (2019|2022|2025).  Ignored when --iso is given.
+  -R, --release REL        2019|2022|2025      [auto-detected from the media]
+      --virtio-iso PATH    Use this virtio-win ISO instead of downloading
+      --cloudbase-msi PATH Use this Cloudbase-Init MSI instead of downloading
+      --spice-exe PATH     Use this spice-guest-tools.exe instead of downloading
+
+${C_BOLD}What to build:${C_RESET}
+  -e, --edition WHICH      core|desktop|both                        [both]
+  -k, --sku SKU            standard|datacenter                      [standard]
+  -I, --start-id ID        First VMID (one per edition, consecutive) [9020]
+      --force              Replace an existing VMID instead of skipping
+
+${C_BOLD}Placement and sizing:${C_RESET}
+  -s, --storage NAME       Storage for VM disks                     [local-lvm]
+      --iso-storage NAME   Storage for generated/downloaded ISOs    [--storage]
+  -B, --bridge NAME        Template NIC bridge                      [vmbr0]
+      --vlan TAG           VLAN tag for the template NIC
+      --build-bridge NAME  Bridge for the build VM       [--bridge; an
+                           uplink-less bridge is recommended]
+  -D, --disk-size GB       OS disk size                             [60]
+  -c, --cpu-type TYPE      CPU model (migration-safe)         [x86-64-v2-AES]
+      --cores N            Template vCPUs                           [2]
+      --memory MB          Template RAM                             [4096]
+      --build-cores N      Build VM vCPUs                           [4]
+      --build-memory MB    Build VM RAM                             [8192]
+      --vga TYPE           std|qxl|virtio                           [std]
+      --no-tpm             Do not attach a TPM 2.0 state volume
+      --no-secureboot      Do not pre-enrol Microsoft Secure Boot keys
+
+${C_BOLD}Windows configuration:${C_RESET}
+      --locale TAG         System/UI locale                         [en-US]
+      --input-locale TAG   Keyboard layout                          [--locale]
+      --timezone TZ        Windows time zone name                   [UTC]
+      --admin-password PW  Administrator password  [random, printed once]
+      --admin-password-file FILE   Read the password from a file
+      --ci-username NAME   Cloudbase-Init managed account    [Administrator]
+
+${C_BOLD}Activation${C_RESET} (no key at all is valid — evaluation / deferred activation):
+      --product-key KEY    Operator-supplied key, embedded in the answer file
+      --product-key-file FILE      Read the key from a file
+      --kms                Use the public Microsoft KMS client key (GVLK)
+                           for this release and SKU.  Not valid on eval media.
+
+${C_BOLD}Caching and timeouts:${C_RESET}
+      --cache-dir DIR      Payload cache  [<iso-storage>/pve-tools-cache/windows-templates]
+      --refresh-cache      Re-download cached media
+      --keep-answer-iso    Keep the generated answer ISO (contains secrets)
+      --keep-on-failure    Do not destroy the build VM when a build fails
+      --install-timeout S  WinPE + Setup + OOBE                     [3600]
+      --payload-timeout S  In-guest payload installation            [1800]
+      --sysprep-timeout S  Reboot + sysprep + power off             [1800]
+
+${C_BOLD}General:${C_RESET}
+  -m, --mode local|remote  Execution mode  [local, or remote when -S is given]
+  -S, --server USER@HOST   Remote mode — target PVE node
+      --show-answer-file   Print the generated Autounattend.xml (redacted)
+  -n, --dry-run            Show actions without executing
+  -h, --help               Show this help
+  -v, --version            Print version
+
+${C_BOLD}Supported:${C_RESET}
+  Windows Server 2019, 2022, 2025 — x86_64, UEFI/GPT, Server Core and
+  Desktop Experience, Standard and Datacenter.
+
+${C_BOLD}Not supported in ${VERSION}:${C_RESET}
+  Desktop Windows editions, BIOS/MBR installs, domain join at build time,
+  multi-NIC cloud-init (PVE's config-drive carries no MAC), and building
+  without Cloudbase-Init (--no-cloudbase-init is not implemented).
+
+${C_BOLD}Examples:${C_RESET}
+  # Core + Desktop Standard templates from an operator-supplied ISO
+  $(basename "$0") --iso dstore01:iso/win2022.iso --storage dstore01
+
+  # Evaluation media, Datacenter, Core only, on an isolated build bridge
+  $(basename "$0") --eval 2025 --sku datacenter --edition core \\
+      --storage dstore01 --build-bridge vmbr1 --start-id 9040
+
+  # Licensed media activated against KMS
+  $(basename "$0") --iso /mnt/iso/win2022-vl.iso --kms --storage dstore01
+
+  # Remote build from a jump host (paths are remote)
+  $(basename "$0") --iso dstore01:iso/win2022.iso --storage dstore01 \\
+      -S root@pve1.example.com
+
+  # Plan only — no VM is created, nothing is downloaded
+  $(basename "$0") --iso dstore01:iso/win2022.iso --storage dstore01 --dry-run
+EOF
+}
+
+# --- Main ---------------------------------------------------------------------
+
+main() {
+    # ---- argument parsing ----------------------------------------------------
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # --- media ---
+            -i|--iso)              WIN_ISO="$2";             shift 2 ;;
+            --eval)                EVAL_RELEASE="$2";        shift 2 ;;
+            -R|--release)          RELEASE="$2";             shift 2 ;;
+            --virtio-iso)          VIRTIO_ISO="$2";          shift 2 ;;
+            --cloudbase-msi)       CLOUDBASE_MSI="$2";       shift 2 ;;
+            --spice-exe)           SPICE_EXE="$2";           shift 2 ;;
+            # --- what to build ---
+            -e|--edition)          EDITION="$2";             shift 2 ;;
+            -k|--sku)              SKU="$2";                 shift 2 ;;
+            -I|--start-id)         START_ID="$2";            shift 2 ;;
+            --force)               FORCE=1;                  shift   ;;
+            # --- placement / sizing ---
+            -s|--storage)          STORAGE="$2";             shift 2 ;;
+            --iso-storage)         ISO_STORAGE="$2";         shift 2 ;;
+            -B|--bridge)           BRIDGE="$2";              shift 2 ;;
+            --vlan)                VLAN="$2";                shift 2 ;;
+            --build-bridge)        BUILD_BRIDGE="$2";        shift 2 ;;
+            -D|--disk-size)        DISK_SIZE="$2";           shift 2 ;;
+            -c|--cpu-type)         CPU_TYPE="$2";            shift 2 ;;
+            --cores)               CORES="$2";               shift 2 ;;
+            --memory)              MEMORY="$2";              shift 2 ;;
+            --build-cores)         BUILD_CORES="$2";         shift 2 ;;
+            --build-memory)        BUILD_MEMORY="$2";        shift 2 ;;
+            --vga)                 VGA="$2";                 shift 2 ;;
+            --no-tpm)              USE_TPM=0;                shift   ;;
+            --no-secureboot)       USE_SECUREBOOT=0;         shift   ;;
+            # --- windows configuration ---
+            --locale)              LOCALE="$2";              shift 2 ;;
+            --input-locale)        INPUT_LOCALE="$2";        shift 2 ;;
+            --timezone)            TIMEZONE="$2";            shift 2 ;;
+            --admin-password)      ADMIN_PASSWORD="$2";      shift 2 ;;
+            --admin-password-file) ADMIN_PASSWORD_FILE="$2"; shift 2 ;;
+            --ci-username)         CI_USERNAME="$2";         shift 2 ;;
+            # --- activation ---
+            --product-key)         PRODUCT_KEY="$2";         shift 2 ;;
+            --product-key-file)    PRODUCT_KEY_FILE="$2";    shift 2 ;;
+            --kms)                 USE_KMS=1;                shift   ;;
+            # --- caching / timeouts ---
+            --cache-dir)           CACHE_DIR="$2";           shift 2 ;;
+            --refresh-cache)       REFRESH_CACHE=1;          shift   ;;
+            --keep-answer-iso)     KEEP_ANSWER_ISO=1;        shift   ;;
+            --keep-on-failure)     KEEP_ON_FAILURE=1;        shift   ;;
+            --install-timeout)     INSTALL_TIMEOUT="$2";     shift 2 ;;
+            --payload-timeout)     PAYLOAD_TIMEOUT="$2";     shift 2 ;;
+            --sysprep-timeout)     SYSPREP_TIMEOUT="$2";     shift 2 ;;
+            # --- general ---
+            -m|--mode)             MODE="$2";                shift 2 ;;
+            -S|--server)           PVE_SERVER="$2";          shift 2 ;;
+            --show-answer-file)    SHOW_ANSWER_FILE=1;       shift   ;;
+            -n|--dry-run)          DRY_RUN=1;                shift   ;;
+            -h|--help)             usage;                    exit 0  ;;
+            -v|--version)          echo "pve-build-windows-template $VERSION"; exit 0 ;;
+            -*)                    die "Unknown option: $1 (see --help)" ;;
+            *)                     die "Unexpected argument: $1 (see --help)" ;;
+        esac
+    done
+
+    # ---- validate arguments --------------------------------------------------
+    case "$MODE" in
+        ""|local|remote) ;;
+        *) die "Invalid --mode: $MODE (expected local or remote)" ;;
+    esac
+    [[ "$MODE" == "remote" && -z "$PVE_SERVER" ]] && \
+        die "--mode remote requires -S USER@HOST"
+    [[ "$MODE" == "local" && -n "$PVE_SERVER" ]] && \
+        die "--mode local is incompatible with -S"
+
+    case "$EDITION" in core|desktop|both) ;; *) die "Invalid --edition: $EDITION (core|desktop|both)" ;; esac
+    case "$SKU"     in standard|datacenter) ;; *) die "Invalid --sku: $SKU (standard|datacenter)" ;; esac
+    case "$VGA"     in std|qxl|virtio) ;; *) die "Invalid --vga: $VGA (std|qxl|virtio)" ;; esac
+    [[ -n "$RELEASE" ]] && { case "$RELEASE" in 2019|2022|2025) ;; *) die "Invalid --release: $RELEASE (2019|2022|2025)" ;; esac; }
+    [[ -n "$EVAL_RELEASE" ]] && { case "$EVAL_RELEASE" in 2019|2022|2025) ;; *) die "Invalid --eval: $EVAL_RELEASE (2019|2022|2025)" ;; esac; }
+
+    [[ "$START_ID" =~ ^[0-9]+$ ]] || die "--start-id must be numeric: $START_ID"
+    [[ "$DISK_SIZE" =~ ^[0-9]+$ ]] || die "--disk-size must be numeric (GB): $DISK_SIZE"
+    local t flag
+    for t in INSTALL_TIMEOUT PAYLOAD_TIMEOUT SYSPREP_TIMEOUT CORES MEMORY BUILD_CORES BUILD_MEMORY; do
+        flag="--${t,,}"; flag="${flag//_/-}"
+        [[ "${!t}" =~ ^[0-9]+$ ]] || die "${flag} must be numeric: ${!t}"
+    done
+
+    [[ -n "$WIN_ISO" || -n "$EVAL_RELEASE" ]] || \
+        die "Missing Windows media: pass --iso PATH, or --eval 2019|2022|2025 to download Microsoft evaluation media"
+    if [[ -n "$WIN_ISO" && -n "$EVAL_RELEASE" ]]; then
+        warn "Both --iso and --eval given — using --iso"
+        EVAL_RELEASE=""
+    fi
+    [[ -z "$EVAL_RELEASE" || -n "$RELEASE" ]] || RELEASE="$EVAL_RELEASE"
+
+    # Secrets from files (this is how remote mode receives them).
+    if [[ -n "$PRODUCT_KEY_FILE" ]]; then
+        [[ -f "$PRODUCT_KEY_FILE" ]] || die "Product key file not found: $PRODUCT_KEY_FILE"
+        PRODUCT_KEY=$(tr -d '\r\n' < "$PRODUCT_KEY_FILE")
+    fi
+    if [[ -n "$ADMIN_PASSWORD_FILE" ]]; then
+        [[ -f "$ADMIN_PASSWORD_FILE" ]] || die "Admin password file not found: $ADMIN_PASSWORD_FILE"
+        ADMIN_PASSWORD=$(tr -d '\r\n' < "$ADMIN_PASSWORD_FILE")
+    fi
+
+    if [[ -n "$PRODUCT_KEY" ]]; then
+        [[ "$PRODUCT_KEY" =~ ^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$ ]] || \
+            die "Invalid product key format (expected XXXXX-XXXXX-XXXXX-XXXXX-XXXXX)"
+        (( USE_KMS )) && die "--product-key and --kms are mutually exclusive"
+    fi
+
+    [[ -z "$INPUT_LOCALE" ]] && INPUT_LOCALE="$LOCALE"
+    [[ -z "$BUILD_BRIDGE" ]] && BUILD_BRIDGE="$BRIDGE"
+
+    (( DRY_RUN )) && echo -e "\n${C_YELLOW}=== DRY RUN ===${C_RESET}\n"
+
+    # ---- select mode of operation --------------------------------------------
+    if [[ -n "$PVE_SERVER" ]]; then
+        delegate_to_server
+        exit $?
+    fi
+
+    # LOCAL MODE
+    [[ $EUID -eq 0 ]] || \
+        die "Local mode requires root on a PVE host (or use -S user@host for remote mode)"
+    check_deps
+
+    # ---- resolve storages ----------------------------------------------------
+    [[ -z "$ISO_STORAGE" ]] && ISO_STORAGE="$STORAGE"
+    storage_supports "$ISO_STORAGE" iso || \
+        die "Storage '${ISO_STORAGE}' does not accept 'iso' content — pass --iso-storage with one that does"
+    local iso_store_path
+    iso_store_path=$(storage_path "$ISO_STORAGE")
+    ISO_DIR="${iso_store_path}/template/iso"
+    mkdir -p "$ISO_DIR"
+
+    [[ -z "$CACHE_DIR" ]] && CACHE_DIR="${iso_store_path}/pve-tools-cache/windows-templates"
+    mkdir -p "$CACHE_DIR"
+
+    # A single eval ISO is 5-6 GB and the build disk another 60 GB thin —
+    # refuse early rather than filling a root dataset.
+    check_free_space "$iso_store_path" 25
+
+    if [[ -z "$ADMIN_PASSWORD" ]]; then
+        # cut, not head: head closes the pipe early, which SIGPIPEs the
+        # upstream filter and trips pipefail.  !7 guarantees the Windows
+        # complexity policy is met whatever the random draw produced.
+        ADMIN_PASSWORD="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-16)!7"
+        msg "Generated Administrator password: ${C_BOLD}${ADMIN_PASSWORD}${C_RESET}"
+        warn "Record it now — it is not stored anywhere and is not printed again."
+    fi
+
+    BUILD_ID="$(date +%s)-$$"
+
+    # ==== STEP 1: resolve media ===============================================
+    msg "Resolving media"
+    if [[ -n "$EVAL_RELEASE" ]]; then
+        fetch_eval_iso "$EVAL_RELEASE"
+    else
+        WIN_ISO_PATH=$(resolve_iso_path "$WIN_ISO")
+        ok "Windows media: $(basename "$WIN_ISO_PATH")"
+    fi
+
+    if [[ -n "$VIRTIO_ISO" ]]; then
+        VIRTIO_ISO_PATH=$(resolve_iso_path "$VIRTIO_ISO")
+        ok "virtio-win: $(basename "$VIRTIO_ISO_PATH")"
+    else
+        fetch_virtio_iso
+    fi
+
+    if [[ -n "$CLOUDBASE_MSI" ]]; then
+        [[ -f "$CLOUDBASE_MSI" ]] || die "Cloudbase-Init MSI not found: $CLOUDBASE_MSI"
+        CLOUDBASE_MSI_PATH="$CLOUDBASE_MSI"
+        ok "Cloudbase-Init: $(basename "$CLOUDBASE_MSI_PATH")"
+    else
+        fetch_cloudbase_msi
+    fi
+
+    if [[ -n "$SPICE_EXE" ]]; then
+        [[ -f "$SPICE_EXE" ]] || die "spice-guest-tools not found: $SPICE_EXE"
+        SPICE_EXE_PATH="$SPICE_EXE"
+        ok "spice-guest-tools: $(basename "$SPICE_EXE_PATH")"
+    else
+        fetch_spice_tools
+    fi
+
+    # ==== STEP 2: inspect the Windows media once ==============================
+    if [[ -f "$WIN_ISO_PATH" ]]; then
+        local win_mnt
+        mount_iso "$WIN_ISO_PATH"; win_mnt="$MNT"
+        probe_windows_iso "$win_mnt"
+        umount_isos
+    elif [[ -n "$RELEASE" ]]; then
+        warn "Media not present locally — planning against --release ${RELEASE}"
+    else
+        die "Dry run without local media: pass --release 2019|2022|2025 so the plan can be resolved"
+    fi
+
+    if (( USE_KMS )) && (( IS_EVAL_MEDIA )); then
+        die "--kms cannot be used with evaluation media: a GVLK will not activate against ServerStandardEval. Use non-eval media, or convert after deployment with: dism /online /set-edition:ServerStandard /productkey:$(gvlk_key "$RELEASE" "$SKU") /accepteula"
+    fi
+    if (( ! IS_EVAL_MEDIA )) && (( ! USE_KMS )) && [[ -z "$PRODUCT_KEY" ]] && [[ -f "$WIN_ISO_PATH" ]]; then
+        warn "Non-evaluation media with no key — Setup may stop on the product-key page. Consider --product-key or --kms."
+    fi
+
+    # ==== STEP 3: build each requested edition ================================
+    local -a editions=()
+    case "$EDITION" in
+        core)    editions=( core ) ;;
+        desktop) editions=( desktop ) ;;
+        both)    editions=( core desktop ) ;;
+    esac
+
+    # A Windows build failure is almost always systemic rather than
+    # per-edition, so build_one dies rather than carrying on to the sibling.
+    local idx=0 ed
+    for ed in "${editions[@]}"; do
+        build_one "$ed" $(( START_ID + idx ))
+        (( idx++ )) || true
+    done
+
+    echo
+    if (( SKIPPED == ${#editions[@]} )); then
+        die "Nothing was built — every target VMID already exists. Pass --force to replace them, or --start-id to pick a free range."
+    elif (( SKIPPED )); then
+        warn "${SKIPPED} of ${#editions[@]} edition(s) skipped — the VMID was already in use"
+    fi
+    ok "$(( ${#editions[@]} - SKIPPED )) template(s) built"
+}
+
+main "$@"
