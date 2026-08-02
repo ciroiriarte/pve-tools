@@ -241,8 +241,11 @@ so the two agree. Any other zone keeps PVE's default local\-time RTC, which
 is what Windows expects.
 .TP
 .BI \-\-admin\-password " PW" "\fR, \fP" \-\-admin\-password\-file " FILE"
-Administrator password. When neither is given a random 18\-character password
-is generated and printed once.
+Administrator password baked into the template. When neither is given a random
+18\-character password is generated and printed once. A clone keeps this
+password until
+.B \-\-cipassword
+replaces it on first boot.
 .TP
 .BI \-\-ci\-username " NAME"
 The account Cloudbase\-Init manages on clones. Default:

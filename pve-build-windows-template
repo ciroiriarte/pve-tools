@@ -1270,6 +1270,17 @@ generate_sysprep_unattend() {
             <UILanguage>${LOCALE}</UILanguage>
             <UserLocale>${LOCALE}</UserLocale>
         </component>
+        <!-- Deliberately NO <UserAccounts><AdministratorPassword> here, unlike
+             the build-time Autounattend.xml.
+             This file runs on every CLONE, and its oobeSystem pass completes
+             AFTER the Cloudbase-Init service has already applied the
+             cloud-init password.  Measured on a Server 2025 clone:
+               15:01:46  cloudbase-init "Password succesfully updated"
+               15:02:21  PasswordLastSet — OOBE re-applying this value
+             so a hard-coded password here silently overrides --cipassword on
+             every clone.  Upstream Cloudbase-Init's own Unattend.xml omits it
+             for the same reason.  The account keeps the build-time password
+             until cloud-init replaces it, so OOBE has nothing to prompt for. -->
         <component name="Microsoft-Windows-Shell-Setup"
                    processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
                    language="neutral" versionScope="nonSxS">
@@ -1284,12 +1295,6 @@ generate_sysprep_unattend() {
                 <SkipMachineOOBE>true</SkipMachineOOBE>
                 <SkipUserOOBE>true</SkipUserOOBE>
             </OOBE>
-            <UserAccounts>
-                <AdministratorPassword>
-                    <Value>${ADMIN_PASSWORD}</Value>
-                    <PlainText>true</PlainText>
-                </AdministratorPassword>
-            </UserAccounts>
             <TimeZone>${TIMEZONE}</TimeZone>
         </component>
     </settings>
@@ -1333,10 +1338,17 @@ username=${CI_USERNAME}
 groups=Administrators
 inject_user_password=true
 first_logon_behaviour=no
-# Proxmox's Cloudbase-Init guide recommends true: with a non-default
-# --ci-username this renames the built-in administrator rather than leaving
-# two admin accounts behind.  A no-op when the name is already Administrator.
-rename_admin_user=true
+# Proxmox's guide recommends true, but measured behaviour on Server 2025
+# argues against it: CreateUserPlugin then calls create_user_logon_session()
+# to materialise the profile, which fails every run with
+#   "Cannot create a user logon session for user Administrator:
+#    User logon failed: 'The user name or password is incorrect.'"
+# because the password it logs on with is not the one the account currently
+# holds.  Server 2025 ships a default lockout policy (threshold 10, 10 min)
+# that 2019/2022 do not, so those failed logons eat into a real budget and
+# repeated cloud-init runs can lock the administrator out.  It buys nothing
+# at the default --ci-username Administrator, which needs no rename.
+rename_admin_user=false
 real_time_clock_utc=${rtc_utc}
 ${activation}
 bsdtar_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\bsdtar.exe
