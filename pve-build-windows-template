@@ -1512,17 +1512,31 @@ create_build_vm() {
 # prompt lives in efisys.bin on the media, and the no-prompt variant would
 # mean remastering the 5 GB Windows ISO.
 #
-# Sending Enter through the QEMU monitor for the first minute is the cheap
-# fix.  It is safe because the install is fully unattended, so there is no
-# dialog for a stray Enter to act on; and because --boot order=scsi0;ide0
-# means every later boot goes straight to the now-bootable disk, so the
-# prompt never appears again and Setup cannot be restarted by accident.
+# Sending Enter through the QEMU monitor is the cheap fix, but the window
+# has to be SHORT.  An earlier version pressed Enter for a full minute on the
+# assumption that an unattended install has no dialog for a stray keypress to
+# hit.  That is false: Setup's "Installing Windows Server" page carries a
+# Cancel button, and a late Enter activates it, leaving the install wedged
+# behind a modal "Are you sure you want to quit?" until the agent timeout
+# expires an hour later.  It was intermittent, so several builds passed
+# before one lost the race.
+#
+# The prompt appears a few seconds after power-on and lasts about five, while
+# WinPE needs the better part of a minute more before any Setup UI exists.
+# Pressing for ~15s therefore clears the prompt with margin and stops long
+# before there is anything to mis-click.  If it is ever missed, the VM stops
+# at "no bootable device" and fails fast, which is a far better outcome than
+# a wedged install.
+#
+# --boot order=scsi0;ide0 means every later boot goes straight to the
+# now-bootable disk, so the prompt never reappears and Setup cannot be
+# restarted by accident.
 press_boot_prompt() {
     local vmid="$1" i
     msg "Answering the boot-from-CD prompt"
-    for (( i = 0; i < 30; i++ )); do
+    for (( i = 0; i < 15; i++ )); do
         echo "sendkey ret" | qm monitor "$vmid" >/dev/null 2>&1 || true
-        sleep 2
+        sleep 1
     done
 }
 
