@@ -167,8 +167,6 @@ SYSPREP_TIMEOUT=1800          # reboot + sysprep -> powered off
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 CLOUDBASE_URL="https://cloudbase.it/downloads/CloudbaseInitSetup_Stable_x64.msi"
 SPICE_URL="https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe"
-EVAL_URL_BASE="https://go.microsoft.com/fwlink/?linkid="
-EVAL_URL_SUFFIX="&clcid=0x409&culture=en-us&country=us"
 
 # Internal state (set during execution)
 TIMESTAMP=$(date +%Y%m%d%H%M)
@@ -220,16 +218,60 @@ release_virtio_dir() {
     esac
 }
 
-# Microsoft Evaluation Center fwlink IDs.  Always use the fwlink form — the
+# Microsoft Evaluation Center links.  Always use the fwlink form — the
 # resolved software-static.download.prss.microsoft.com URL is rotated with
 # every servicing refresh, which is also why no checksum is pinned.
-release_eval_linkid() {
-    case "$1" in
-        2019) echo "2195167" ;;
-        2022) echo "2195280" ;;
-        2025) echo "2293312" ;;
-        *) die "No evaluation media known for release: $1" ;;
+#
+# The two releases differ in how they select a language, which is not
+# documented anywhere and was determined by probing:
+#   2019/2022 — one linkid, language chosen by the clcid/culture parameters.
+#   2025      — one linkid PER LANGUAGE; clcid/culture are ignored, so the
+#               2019-style URL silently returns en-US whatever you ask for.
+eval_lang_clcid() {
+    case "${1,,}" in
+        en-us) echo "0x409" ;;
+        fr-fr) echo "0x40c" ;;
+        zh-cn) echo "0x804" ;;
+        es-es) echo "0x40a" ;;
+        de-de) echo "0x407" ;;
+        it-it) echo "0x410" ;;
+        ja-jp) echo "0x411" ;;
+        ru-ru) echo "0x419" ;;
+        *) return 1 ;;
     esac
+}
+
+eval_2025_linkid() {
+    case "${1,,}" in
+        en-us) echo "2345730" ;;
+        zh-cn) echo "2345732" ;;
+        fr-fr) echo "2345733" ;;
+        es-es) echo "2345734" ;;
+        de-de) echo "2345827" ;;
+        ja-jp) echo "2345828" ;;
+        ru-ru) echo "2345829" ;;
+        it-it) echo "2345927" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Full download URL for a release in a given language.
+eval_url() {
+    local rel="$1" lang="$2" linkid clcid
+    case "$rel" in
+        2019) linkid="2195167" ;;
+        2022) linkid="2195280" ;;
+        2025)
+            linkid=$(eval_2025_linkid "$lang") || \
+                die "Windows Server 2025 evaluation media is not offered in '${lang}'. Available: en-US fr-FR es-ES de-DE it-IT ja-JP ru-RU zh-CN. Supply the ISO with --iso instead."
+            echo "https://go.microsoft.com/fwlink/?linkid=${linkid}"
+            return 0
+            ;;
+        *) die "No evaluation media known for release: $rel" ;;
+    esac
+    clcid=$(eval_lang_clcid "$lang") || \
+        die "Windows Server ${rel} evaluation media is not offered in '${lang}'. Available: en-US fr-FR es-ES de-DE it-IT ja-JP ru-RU zh-CN. Supply the ISO with --iso instead."
+    echo "https://go.microsoft.com/fwlink/?linkid=${linkid}&clcid=${clcid}&culture=${lang,,}&country=us"
 }
 
 # Public Microsoft KMS client setup keys (GVLK).  Core and Desktop share a
@@ -495,16 +537,17 @@ resolved_basename() {
 # path — they also emit progress on stdout, which a command substitution
 # would otherwise swallow into the result.
 
+# With --eval, --locale selects which localisation to download; the media's
+# own language then feeds the answer file, so the two always agree.
 fetch_eval_iso() {
-    local rel="$1" linkid url
-    linkid=$(release_eval_linkid "$rel")
-    url="${EVAL_URL_BASE}${linkid}${EVAL_URL_SUFFIX}"
-    local dest="${ISO_DIR}/win${rel}-eval-en-us.iso"
+    local rel="$1" lang="${2:-en-US}" url
+    url=$(eval_url "$rel" "$lang")
+    local dest="${ISO_DIR}/win${rel}-eval-${lang,,}.iso"
 
-    warn "Downloading Microsoft evaluation media for Server ${rel} (180-day trial)."
+    warn "Downloading Microsoft evaluation media for Server ${rel} ${lang} (180-day trial)."
     warn "The resulting template is an evaluation install — supply --product-key"
     warn "or use non-eval media for a production template."
-    download_file "$url" "$dest" "Windows Server ${rel} evaluation ISO (~5-6 GB)"
+    download_file "$url" "$dest" "Windows Server ${rel} ${lang} evaluation ISO (~5-6 GB)"
 
     if [[ -f "$dest" ]]; then
         local size
@@ -1855,6 +1898,8 @@ ${C_BOLD}Media${C_RESET} (Windows media is never downloaded unless you ask for -
   -i, --iso PATH           Windows ISO — path or STORAGE:iso/NAME
       --eval RELEASE       Download the Microsoft 180-day evaluation ISO
                            (2019|2022|2025).  Ignored when --iso is given.
+                           --locale selects the localisation to fetch:
+                           en-US fr-FR es-ES de-DE it-IT ja-JP ru-RU zh-CN.
   -R, --release REL        2019|2022|2025      [auto-detected from the media]
       --virtio-iso PATH    Use this virtio-win ISO instead of downloading
       --cloudbase-msi PATH Use this Cloudbase-Init MSI instead of downloading
@@ -1933,6 +1978,9 @@ ${C_BOLD}Examples:${C_RESET}
   # Evaluation media, Datacenter, Core only, on an isolated build bridge
   $(basename "$0") --eval 2025 --sku datacenter --edition core \\
       --storage dstore01 --build-bridge vmbr1 --start-id 9040
+
+  # French Server 2025 evaluation media
+  $(basename "$0") --eval 2025 --locale fr-FR --storage dstore01
 
   # Licensed media activated against KMS
   $(basename "$0") --iso /mnt/iso/win2022-vl.iso --kms --storage dstore01
@@ -2107,7 +2155,9 @@ main() {
     # ==== STEP 1: resolve media ===============================================
     msg "Resolving media"
     if [[ -n "$EVAL_RELEASE" ]]; then
-        fetch_eval_iso "$EVAL_RELEASE"
+        # Auto-detection cannot help here: the language has to be chosen
+        # before the media exists, so --locale (default en-US) picks it.
+        fetch_eval_iso "$EVAL_RELEASE" "$LOCALE"
     else
         WIN_ISO_PATH=$(resolve_iso_path "$WIN_ISO")
         ok "Windows media: $(basename "$WIN_ISO_PATH")"
