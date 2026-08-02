@@ -847,7 +847,9 @@ ${drive_paths}            </DriverPaths>
                    xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
 
             <!-- No Recovery partition: a trailing WinRE partition makes C:
-                 unextendable, which breaks qm resize + ExtendVolumesPlugin. -->
+                 unextendable, which breaks qm resize + ExtendVolumesPlugin.
+                 Server 2025 Setup ignores this and appends one anyway, so
+                 setup-complete.ps1 reclaims it after the install. -->
             <DiskConfiguration>
                 <WillShowUI>OnError</WillShowUI>
                 <Disk wcm:action="add">
@@ -1102,6 +1104,29 @@ if (Test-Path -LiteralPath $conf) {
     Mark 'CBI-CONF-OK'
 } else {
     Mark 'CBI-CONF-FAIL'
+}
+
+# Server 2025 Setup creates its own WinRE recovery partition at the END of
+# the disk whatever layout the answer file asks for.  Sitting after C:, it
+# makes the volume unextendable and so breaks `qm resize` plus
+# Cloudbase-Init's ExtendVolumesPlugin on every clone -- the exact failure
+# the three-partition layout exists to avoid.  WinRE is of little value in a
+# template, so disable it, reclaim the partition and grow C: over it.
+# On 2019/2022, where Setup honours the layout, there is nothing to do.
+try {
+    $rec = Get-Partition -DiskNumber 0 -ErrorAction Stop |
+           Where-Object { $_.Type -eq 'Recovery' }
+    if ($rec) {
+        & reagentc.exe /disable | Out-Null
+        $rec | Remove-Partition -Confirm:$false -ErrorAction Stop
+        $max = (Get-PartitionSupportedSize -DriveLetter C).SizeMax
+        Resize-Partition -DriveLetter C -Size $max -ErrorAction Stop
+        Mark 'RECOVERY-RECLAIMED'
+    } else {
+        Mark 'RECOVERY-NONE'
+    }
+} catch {
+    Mark 'RECOVERY-WARN'
 }
 EOF
 
@@ -1555,22 +1580,46 @@ vm_disk_path() {
     pvesm path "$ref" 2>/dev/null
 }
 
-# Read a file out of the stopped guest's disk.
+# Reading files back out of a finished build disk has two traps, both of
+# which produced false "sysprep failed" reports on perfectly good images:
 #
-# Drive letters are deliberately NOT used.  `sysprep /generalize` clears the
-# MountedDevices registry data that libguestfs needs to map C:, so after a
-# successful sysprep `virt-cat -a disk 'C:\...'` fails with "to use Windows
-# drive letters, this must be a Windows guest" — on a perfectly good image.
-# Verifying a generalized image therefore has to go through filesystem paths
-# via guestfish -i, which mounts the inspected Windows root at /.
+#   1. Drive letters are unusable.  `sysprep /generalize` clears the
+#      MountedDevices registry data libguestfs needs to map C:, so
+#      `virt-cat -a disk 'C:\...'` fails with "to use Windows drive letters,
+#      this must be a Windows guest".
+#   2. OS inspection is unusable.  Server 2025 Setup adds its own WinRE
+#      recovery partition regardless of the answer file's layout, so the disk
+#      carries two NTFS volumes, `inspect-os` declines to choose, and
+#      `guestfish -i` silently returns nothing at all.
+#
+# So the Windows volume is located positively, by looking for the one NTFS
+# partition that actually contains \Windows\System32, and mounted explicitly.
+WIN_PART=""                   # cached per disk by detect_windows_part()
+WIN_PART_DISK=""
+
+detect_windows_part() {
+    local disk="$1" part
+    [[ "$disk" == "$WIN_PART_DISK" && -n "$WIN_PART" ]] && return 0
+    for part in $(guestfish --ro -a "$disk" run : list-filesystems 2>/dev/null \
+                  | awk -F: '/ntfs/ {print $1}'); do
+        if guestfish --ro -a "$disk" -m "$part" ls /Windows/System32 &>/dev/null; then
+            WIN_PART="$part"; WIN_PART_DISK="$disk"
+            return 0
+        fi
+    done
+    return 1
+}
+
 guest_disk_cat() {
     local disk="$1" path="$2"
-    guestfish --ro -a "$disk" -i cat "$path" 2>/dev/null
+    detect_windows_part "$disk" || return 1
+    guestfish --ro -a "$disk" -m "$WIN_PART" cat "$path" 2>/dev/null
 }
 
 guest_disk_ls() {
     local disk="$1" path="$2"
-    guestfish --ro -a "$disk" -i ls "$path" 2>/dev/null
+    detect_windows_part "$disk" || return 1
+    guestfish --ro -a "$disk" -m "$WIN_PART" ls "$path" 2>/dev/null
 }
 
 # A stopped VM proves nothing on its own — verify offline that sysprep
@@ -1578,6 +1627,9 @@ guest_disk_ls() {
 verify_sysprep() {
     local vmid="$1" disk
     disk=$(vm_disk_path "$vmid") || die "Cannot resolve the OS disk of VM ${vmid}"
+
+    detect_windows_part "$disk" || \
+        die "Cannot find the Windows volume on the build disk of VM ${vmid} — the install did not get far enough to create one"
 
     guest_disk_ls "$disk" '/Windows/System32/Sysprep' \
         | grep -qix 'Sysprep_succeeded.tag' || \

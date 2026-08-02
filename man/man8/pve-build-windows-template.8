@@ -526,6 +526,14 @@ installed regardless \(em the display type is a clone\-time decision made with
 .IP \(bu 2
 The virtio\-win ISO must be new enough for the target release. The script
 refuses to build rather than producing a broken template.
+.IP \(bu 2
+Windows Server 2025 Setup appends a WinRE recovery partition after the system
+volume whatever partition layout the answer file specifies, which would leave
+.B C:
+unextendable. The build disables WinRE and reclaims that partition before
+sealing, so
+.B qm resize
+behaves the same on every supported release.
 
 .SH SEE ALSO
 .BR pve\-import\-cloud\-images (8),

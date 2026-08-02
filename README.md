@@ -405,7 +405,7 @@ PVE presents cloud-init to Windows guests as an OpenStack config-drive (`citype 
 | `--cipassword` | Works — arrives as `admin_pass` in `meta_data.json` and is applied to the managed account. Note `qm cloudinit dump <id> meta` does **not** show it: that subcommand renders the generic config-drive metadata, not the Cloudbase-Init variant PVE actually generates for Windows guests |
 | `--sshkeys` | Works — written to `C:\Users\<ci-username>\.ssh\authorized_keys`. Windows Server has no SSH server by default, so the keys sit unused until you install the OpenSSH Server feature |
 | `--name` (hostname) | Works, but **only** because `UserDataPlugin` is enabled. PVE's Windows `meta_data.json` carries no `hostname` key; the hostname arrives inside `user_data` as cloud-config. Removing `UserDataPlugin` from `cloudbase-init.conf` silently breaks `qm clone --name` |
-| `qm resize` | Works — `ExtendVolumesPlugin` grows `C:`. The generated disk layout deliberately omits a trailing WinRE recovery partition, which would otherwise make `C:` unextendable |
+| `qm resize` | Works — `ExtendVolumesPlugin` grows `C:`. The generated disk layout deliberately omits a trailing WinRE recovery partition, which would otherwise make `C:` unextendable. Server 2025 Setup appends one regardless of the answer file, so the build disables WinRE and reclaims that partition before sealing (`RECOVERY-RECLAIMED` in the build log); 2019 and 2022 report `RECOVERY-NONE` |
 
 ```bash
 qm clone 9020 130 --name winsrv01 --full
