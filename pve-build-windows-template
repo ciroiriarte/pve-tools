@@ -778,6 +778,36 @@ specialize_productkey_block() {
     echo "            <ProductKey>$(gvlk_key "$RELEASE" "$SKU")</ProductKey>"
 }
 
+# Windows reports a malformed answer file only as a bare "The answer file is
+# invalid" at a line/column, and for the sysprep file that surfaces roughly
+# forty minutes into a build.  Parse every generated answer file here instead.
+# The trap that motivated this: a literal double hyphen is illegal inside an
+# XML comment, so an explanatory comment mentioning a command-line flag
+# silently invalidated the whole file.
+validate_xml() {
+    local file="$1"
+    python3 - "$file" <<'PY' || die "Generated XML is malformed: ${file} (see the parser error above)"
+import sys
+from xml.parsers import expat
+
+# Answer files we generate contain no DTD and no entities.  Rejecting both
+# outright keeps this a pure well-formedness check and rules out entity
+# expansion, without depending on defusedxml (absent on a stock PVE node).
+def reject(*_a, **_k):
+    raise ValueError("DTD or entity declaration in a generated answer file")
+
+parser = expat.ParserCreate()
+parser.StartDoctypeDeclHandler = reject
+parser.EntityDeclHandler = reject
+try:
+    with open(sys.argv[1], "rb") as fh:
+        parser.ParseFile(fh)
+except Exception as exc:
+    print("   [-] %s: %s" % (sys.argv[1], exc), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 # Microsoft caps RunSynchronousCommand/Path at 259 characters (MAX_PATH) and
 # rejects the entire answer file with an unhelpful "Value is invalid." when it
 # is exceeded — a failure that only surfaces in the specialize pass, roughly
@@ -1270,17 +1300,19 @@ generate_sysprep_unattend() {
             <UILanguage>${LOCALE}</UILanguage>
             <UserLocale>${LOCALE}</UserLocale>
         </component>
-        <!-- Deliberately NO <UserAccounts><AdministratorPassword> here, unlike
-             the build-time Autounattend.xml.
-             This file runs on every CLONE, and its oobeSystem pass completes
-             AFTER the Cloudbase-Init service has already applied the
-             cloud-init password.  Measured on a Server 2025 clone:
-               15:01:46  cloudbase-init "Password succesfully updated"
-               15:02:21  PasswordLastSet — OOBE re-applying this value
-             so a hard-coded password here silently overrides --cipassword on
-             every clone.  Upstream Cloudbase-Init's own Unattend.xml omits it
-             for the same reason.  The account keeps the build-time password
-             until cloud-init replaces it, so OOBE has nothing to prompt for. -->
+        <!-- No UserAccounts/AdministratorPassword here, unlike the build-time
+             Autounattend.xml.  This file runs on every CLONE, and its
+             oobeSystem pass completes AFTER the Cloudbase-Init service has
+             already applied the cloud-init password.  Measured on a Server
+             2025 clone: cloudbase-init reported "Password succesfully
+             updated" at 15:01:46, then PasswordLastSet moved to 15:02:21 as
+             OOBE re-applied this value.  A hard-coded password here therefore
+             overrides the cloud-init one on every clone.  Upstream
+             Cloudbase-Init's own Unattend.xml omits it for the same reason.
+             The account keeps the build-time password until cloud-init
+             replaces it, so OOBE has nothing to prompt for.
+             (Careful editing this: a literal double hyphen is illegal inside
+             an XML comment and makes the whole answer file unparseable.) -->
         <component name="Microsoft-Windows-Shell-Setup"
                    processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
                    language="neutral" versionScope="nonSxS">
@@ -1791,6 +1823,12 @@ build_one() {
     generate_sysprep_cmd
     generate_sysprep_unattend
     generate_cloudbase_conf
+
+    # Catch a malformed answer file now, not forty minutes into the build.
+    validate_xml "${STAGE_DIR}/Autounattend.xml"
+    validate_xml "${STAGE_DIR}/pvebuild/pve-sysprep.xml"
+    ok "Answer files are well-formed XML"
+
     build_answer_iso
 
     umount_isos
