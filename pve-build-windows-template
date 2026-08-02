@@ -50,7 +50,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 set -euo pipefail
 
@@ -131,9 +131,11 @@ BUILD_MEMORY=8192
 VGA="std"                     # std|qxl|virtio
 USE_TPM=1
 USE_SECUREBOOT=1
+ENABLE_RDP=1                  # issue #1: RDP enabled + firewall rule
 
-LOCALE="en-US"
-INPUT_LOCALE=""               # defaults to $LOCALE
+LOCALE="en-US"                # overridden by the media language unless --locale
+LOCALE_SET=0                  # 1 once --locale was given explicitly
+INPUT_LOCALE=""               # defaults to the resolved $LOCALE
 TIMEZONE="UTC"
 FULLNAME="Proxmox VE"
 ORGANIZATION="pve-tools"
@@ -141,6 +143,7 @@ ORGANIZATION="pve-tools"
 PRODUCT_KEY=""
 PRODUCT_KEY_FILE=""
 USE_KMS=0
+KMS_HOST=""                   # optional KMS server for clone-time activation
 ADMIN_PASSWORD=""
 ADMIN_PASSWORD_FILE=""
 CI_USERNAME="Administrator"
@@ -186,6 +189,8 @@ MNT=""                        # most recent mount_iso() result
 CURRENT_EDITION=""            # edition being built right now
 SKIPPED=0                     # editions skipped because the VMID was in use
 GUEST_STATE=""                # final contents of the guest's state.txt
+MEDIA_LOCALE=""               # language reported by the Windows media
+CURRENT_PART=""               # in-flight download, removed by cleanup()
 WIM_NAMES=""
 SHOW_ANSWER_FILE=0
 
@@ -306,8 +311,11 @@ cleanup() {
     if (( ! KEEP_ANSWER_ISO )) && [[ -n "$ANSWER_ISO_PATH" ]]; then
         rm -f "$ANSWER_ISO_PATH"
     fi
-    [[ -n "$CACHE_DIR" && -d "$CACHE_DIR" ]] && rm -f "$CACHE_DIR"/*.part
-    [[ -n "$ISO_DIR"   && -d "$ISO_DIR"   ]] && rm -f "$ISO_DIR"/*.part
+    # Only this run's partial download, never a *.part glob: the cache is
+    # shared, so a glob would delete a concurrent run's in-flight transfer.
+    # Partials left by an interrupted run are kept deliberately — curl -C -
+    # resumes them.
+    [[ -n "$CURRENT_PART" ]] && rm -f "$CURRENT_PART"
     [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]] && rm -rf "$STAGE_DIR"
 
     return $rc
@@ -450,6 +458,7 @@ download_file() {
     local -a progress=( -s )
     [[ -t 1 ]] && progress=( --progress-bar )
 
+    CURRENT_PART="${dest}.part"
     local attempt rc=1
     for attempt in 1 2 3; do
         if (( attempt > 1 )); then
@@ -466,6 +475,7 @@ download_file() {
         die "Download failed: ${url}"
     fi
     mv "${dest}.part" "$dest"
+    CURRENT_PART=""
     ok "Downloaded: ${what}"
 }
 
@@ -542,40 +552,78 @@ mount_iso() {
     MNT="$mnt"
 }
 
+# NT build number -> Windows Server release.  Used in preference to the
+# product name because it is identical on every localisation of the media.
+build_to_release() {
+    case "$1" in
+        17763) echo 2019 ;;
+        20348) echo 2022 ;;
+        26100) echo 2025 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Inspect the Windows media: list the images it contains, detect whether it
-# is evaluation media, and derive the release when --release was not given.
+# is evaluation media, and derive the release and language when they were
+# not given.
+#
+# Language handling: the WIM "Name" field is NOT localised — Spanish media
+# still reports "Windows Server 2025 SERVERSTANDARDCORE" — so edition
+# selection works on any localisation.  The media's own language is read
+# from "Default Language" and becomes the default for --locale, because
+# SetupUILanguage has to name a language actually present on the media.
 probe_windows_iso() {
     local mnt="$1"
     local wim="${mnt}/sources/install.wim"
     [[ -f "$wim" ]] || wim="${mnt}/sources/install.esd"
     [[ -f "$wim" ]] || die "No sources/install.wim or install.esd on the media — is this a Windows installation ISO?"
 
-    WIM_NAMES=$(wim_info "$wim" | sed -n 's/^Name:[[:space:]]*//p')
+    local info
+    info=$(wim_info "$wim") || die "Could not read image metadata from ${wim}"
+
+    WIM_NAMES=$(sed -n 's/^Name:[[:space:]]*//p' <<< "$info")
     [[ -n "$WIM_NAMES" ]] || die "Could not read image names from ${wim}"
+
+    MEDIA_LOCALE=$(sed -n 's/^Default Language:[[:space:]]*//p' <<< "$info" | head -1 | tr -d '[:space:]')
+    local build
+    build=$(sed -n 's/^Build:[[:space:]]*//p' <<< "$info" | head -1 | tr -d '[:space:]')
 
     # Evaluation media carries sources/EI.CFG with [Channel] eval, which is
     # what suppresses Setup's product-key page.
     IS_EVAL_MEDIA=0
     if [[ -f "${mnt}/sources/EI.CFG" ]] && grep -qi 'eval' "${mnt}/sources/EI.CFG"; then
         IS_EVAL_MEDIA=1
-    elif wim_info "$wim" | grep -qi '^Edition ID:.*Eval'; then
+    elif grep -qi '^Edition ID:.*Eval' <<< "$info"; then
         IS_EVAL_MEDIA=1
     fi
 
     if [[ -z "$RELEASE" ]]; then
-        local r
-        for r in 2025 2022 2019; do
-            if grep -q "Windows Server ${r} " <<< "$WIM_NAMES"; then
-                RELEASE="$r"; break
-            fi
-        done
-        [[ -n "$RELEASE" ]] || die "Cannot detect the Windows Server release from the media — pass --release 2019|2022|2025. Images found:
+        [[ -n "$build" ]] && RELEASE=$(build_to_release "$build" || true)
+        # Fall back to the product name only if the build is unrecognised.
+        if [[ -z "$RELEASE" ]]; then
+            local r
+            for r in 2025 2022 2019; do
+                if grep -q "Windows Server ${r} " <<< "$WIM_NAMES"; then
+                    RELEASE="$r"; break
+                fi
+            done
+        fi
+        [[ -n "$RELEASE" ]] || die "Cannot detect the Windows Server release from the media (build '${build:-unknown}') — pass --release 2019|2022|2025. Images found:
 $(sed 's/^/     /' <<< "$WIM_NAMES")"
-        ok "Detected release: Windows Server ${RELEASE}$( (( IS_EVAL_MEDIA )) && echo ' (evaluation media)' )"
-    else
-        grep -q "Windows Server ${RELEASE} " <<< "$WIM_NAMES" || \
-            warn "--release ${RELEASE} given but no matching image name on the media"
+        ok "Detected release: Windows Server ${RELEASE} (build ${build:-?})$( (( IS_EVAL_MEDIA )) && echo ' (evaluation media)' )"
     fi
+
+    # SetupUILanguage must name a language that exists on the media, so an
+    # en-US default would break every non-English ISO.
+    if (( ! LOCALE_SET )) && [[ -n "$MEDIA_LOCALE" ]]; then
+        if [[ "$MEDIA_LOCALE" != "$LOCALE" ]]; then
+            ok "Media language: ${MEDIA_LOCALE} — using it for --locale (override with --locale)"
+        fi
+        LOCALE="$MEDIA_LOCALE"
+    elif (( LOCALE_SET )) && [[ -n "$MEDIA_LOCALE" && "$MEDIA_LOCALE" != "$LOCALE" ]]; then
+        warn "--locale ${LOCALE} does not match the media language ${MEDIA_LOCALE}; Setup may stop on the language page"
+    fi
+    [[ -z "$INPUT_LOCALE" ]] && INPUT_LOCALE="$LOCALE"
 }
 
 # Pick the exact /IMAGE/NAME for a SKU x edition pair out of the media.
@@ -1012,6 +1060,29 @@ if (Test-Path -LiteralPath $conf) {
 } else {
     Mark 'CBI-CONF-FAIL'
 }
+EOF
+
+    # Remote Desktop, per issue #1.  Appended rather than inlined because the
+    # heredoc above is quoted (no shell expansion) and this block is optional.
+    if (( ENABLE_RDP )); then
+        cat >> "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
+
+# Enable Remote Desktop and open the matching firewall rules.
+# -DisplayGroup 'Remote Desktop' is a LOCALISED string and does not match on
+# a Spanish or Russian install; the @FirewallAPI.dll,-28752 indirect
+# reference is the same on every localisation.
+try {
+    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+        -Name fDenyTSConnections -Value 0 -ErrorAction Stop
+    Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction SilentlyContinue
+    Mark 'RDP-OK'
+} catch {
+    Mark 'RDP-WARN'
+}
+EOF
+    fi
+
+    cat >> "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
 
 Mark 'INSTALLS-DONE'
 
@@ -1171,6 +1242,21 @@ EOF
 # UserDataPlugin -> cloudconfig -> set_hostname.  Drop UserDataPlugin and
 # `qm set <id> --name` silently stops working.
 generate_cloudbase_conf() {
+    # Windows time zone names are language-invariant, so a UTC guest clock
+    # pairs with the RTC=UTC set on the VM; anything else keeps PVE's default
+    # local-time RTC.  See create_build_vm().
+    local rtc_utc=false
+    [[ "$TIMEZONE" == "UTC" ]] && rtc_utc=true
+
+    # Optional KMS activation on the clone.  The GVLK itself is already baked
+    # in at build time via --kms; this points clones at a specific KMS host
+    # and lets Cloudbase-Init trigger activation.
+    local activation=""
+    if [[ -n "$KMS_HOST" ]]; then
+        activation="activate_windows=true
+kms_host=${KMS_HOST}"
+    fi
+
     local dest="${STAGE_DIR}/pvebuild/cloudbase-init.conf"
     cat > "$dest" <<EOF
 # Generated by pve-build-windows-template ${VERSION}
@@ -1179,7 +1265,12 @@ username=${CI_USERNAME}
 groups=Administrators
 inject_user_password=true
 first_logon_behaviour=no
-rename_admin_user=false
+# Proxmox's Cloudbase-Init guide recommends true: with a non-default
+# --ci-username this renames the built-in administrator rather than leaving
+# two admin accounts behind.  A no-op when the name is already Administrator.
+rename_admin_user=true
+real_time_clock_utc=${rtc_utc}
+${activation}
 bsdtar_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\bsdtar.exe
 mtools_path=C:\\Program Files\\Cloudbase Solutions\\Cloudbase-Init\\bin\\
 verbose=true
@@ -1273,6 +1364,13 @@ create_build_vm() {
     efi_opts="${STORAGE}:0,efitype=4m"
     (( USE_SECUREBOOT )) && efi_opts+=",pre-enrolled-keys=1" || efi_opts+=",pre-enrolled-keys=0"
 
+    # PVE presents Windows guests an RTC in local time by default, and Windows
+    # reads it that way.  Only force RTC=UTC when the guest time zone is UTC
+    # too, otherwise the two disagree by the zone offset.  Cloudbase-Init is
+    # told the same thing through real_time_clock_utc.
+    local localtime_opt=1
+    [[ "$TIMEZONE" == "UTC" ]] && localtime_opt=0
+
     msg "Creating build VM ${vmid} (${ostype}, ${BUILD_CORES} cores, ${BUILD_MEMORY} MB)"
 
     run qm create "$vmid" --name "pve-winbuild-${vmid}-${RELEASE}" \
@@ -1280,7 +1378,7 @@ create_build_vm() {
         --cpu "cputype=${CPU_TYPE}" \
         --sockets 1 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
         --scsihw virtio-scsi-single --agent enabled=1 \
-        --net0 "$net0" --vga "$VGA" --localtime 0
+        --net0 "$net0" --vga "$VGA" --localtime "$localtime_opt"
 
     BUILD_VMID="$vmid"
 
@@ -1690,8 +1788,13 @@ delegate_to_server() {
     rcmd+=( --disk-size "$DISK_SIZE" --cpu-type "$CPU_TYPE" )
     rcmd+=( --cores "$CORES" --memory "$MEMORY" )
     rcmd+=( --build-cores "$BUILD_CORES" --build-memory "$BUILD_MEMORY" )
-    rcmd+=( --vga "$VGA" --locale "$LOCALE" --timezone "$TIMEZONE" )
+    rcmd+=( --vga "$VGA" --timezone "$TIMEZONE" )
+    # Only forward --locale when it was given explicitly; otherwise the remote
+    # side must stay free to adopt the media's own language.
+    (( LOCALE_SET )) && rcmd+=( --locale "$LOCALE" )
+    [[ -n "$INPUT_LOCALE" ]] && rcmd+=( --input-locale "$INPUT_LOCALE" )
     rcmd+=( --ci-username "$CI_USERNAME" )
+    [[ -n "$KMS_HOST" ]] && rcmd+=( --kms-host "$KMS_HOST" )
     rcmd+=( --install-timeout "$INSTALL_TIMEOUT" )
     rcmd+=( --payload-timeout "$PAYLOAD_TIMEOUT" )
     rcmd+=( --sysprep-timeout "$SYSPREP_TIMEOUT" )
@@ -1702,6 +1805,7 @@ delegate_to_server() {
     (( USE_KMS ))          && rcmd+=( --kms )
     (( USE_TPM ))          || rcmd+=( --no-tpm )
     (( USE_SECUREBOOT ))   || rcmd+=( --no-secureboot )
+    (( ENABLE_RDP ))       || rcmd+=( --no-rdp )
     (( REFRESH_CACHE ))    && rcmd+=( --refresh-cache )
     (( KEEP_ANSWER_ISO ))  && rcmd+=( --keep-answer-iso )
     (( KEEP_ON_FAILURE ))  && rcmd+=( --keep-on-failure )
@@ -1778,6 +1882,7 @@ ${C_BOLD}Placement and sizing:${C_RESET}
       --vga TYPE           std|qxl|virtio                           [std]
       --no-tpm             Do not attach a TPM 2.0 state volume
       --no-secureboot      Do not pre-enrol Microsoft Secure Boot keys
+      --no-rdp             Do not enable Remote Desktop in the template
 
 ${C_BOLD}Windows configuration:${C_RESET}
       --locale TAG         System/UI locale                         [en-US]
@@ -1792,6 +1897,8 @@ ${C_BOLD}Activation${C_RESET} (no key at all is valid — evaluation / deferred 
       --product-key-file FILE      Read the key from a file
       --kms                Use the public Microsoft KMS client key (GVLK)
                            for this release and SKU.  Not valid on eval media.
+      --kms-host HOST[:PORT]       Point clones at this KMS server and let
+                           Cloudbase-Init activate them on first boot
 
 ${C_BOLD}Caching and timeouts:${C_RESET}
       --cache-dir DIR      Payload cache  [<iso-storage>/pve-tools-cache/windows-templates]
@@ -1814,7 +1921,7 @@ ${C_BOLD}Supported:${C_RESET}
   Windows Server 2019, 2022, 2025 — x86_64, UEFI/GPT, Server Core and
   Desktop Experience, Standard and Datacenter.
 
-${C_BOLD}Not supported in ${VERSION}:${C_RESET}
+${C_BOLD}Not supported in v${VERSION}:${C_RESET}
   Desktop Windows editions, BIOS/MBR installs, domain join at build time,
   multi-NIC cloud-init (PVE's config-drive carries no MAC), and building
   without Cloudbase-Init (--no-cloudbase-init is not implemented).
@@ -1872,8 +1979,9 @@ main() {
             --vga)                 VGA="$2";                 shift 2 ;;
             --no-tpm)              USE_TPM=0;                shift   ;;
             --no-secureboot)       USE_SECUREBOOT=0;         shift   ;;
+            --no-rdp)              ENABLE_RDP=0;             shift   ;;
             # --- windows configuration ---
-            --locale)              LOCALE="$2";              shift 2 ;;
+            --locale)              LOCALE="$2"; LOCALE_SET=1; shift 2 ;;
             --input-locale)        INPUT_LOCALE="$2";        shift 2 ;;
             --timezone)            TIMEZONE="$2";            shift 2 ;;
             --admin-password)      ADMIN_PASSWORD="$2";      shift 2 ;;
@@ -1883,6 +1991,7 @@ main() {
             --product-key)         PRODUCT_KEY="$2";         shift 2 ;;
             --product-key-file)    PRODUCT_KEY_FILE="$2";    shift 2 ;;
             --kms)                 USE_KMS=1;                shift   ;;
+            --kms-host)            KMS_HOST="$2";            shift 2 ;;
             # --- caching / timeouts ---
             --cache-dir)           CACHE_DIR="$2";           shift 2 ;;
             --refresh-cache)       REFRESH_CACHE=1;          shift   ;;
@@ -1951,7 +2060,8 @@ main() {
         (( USE_KMS )) && die "--product-key and --kms are mutually exclusive"
     fi
 
-    [[ -z "$INPUT_LOCALE" ]] && INPUT_LOCALE="$LOCALE"
+    # INPUT_LOCALE is resolved in probe_windows_iso(), once the media's own
+    # language is known.
     [[ -z "$BUILD_BRIDGE" ]] && BUILD_BRIDGE="$BRIDGE"
 
     (( DRY_RUN )) && echo -e "\n${C_YELLOW}=== DRY RUN ===${C_RESET}\n"

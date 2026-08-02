@@ -324,6 +324,18 @@ Product keys never appear in `--dry-run` output, in diagnostics, or in any proce
 
 x86_64 and UEFI/GPT only. PVE has no `win2k19`/`win2k22` ostype — `win10` covers 2016/2019 and `win11` covers 2022/2025.
 
+### Language support
+
+**Any Windows Server localisation works** — English, Spanish, Russian, Japanese and so on — with no extra arguments. Three things make that true:
+
+- **Edition selection is language-invariant.** The script matches the WIM `Name` field, which Microsoft does not localise: Spanish media still reports `Windows Server 2025 SERVERSTANDARDCORE`. (Verified against `es-MX` media — the localised strings live in `Display Name`, which the script deliberately ignores.)
+- **The release is detected from the NT build number** (`17763` → 2019, `20348` → 2022, `26100` → 2025), not from an English product string. `--release` overrides it.
+- **`--locale` defaults to the media's own language**, read from the WIM `Default Language`. `SetupUILanguage` has to name a language that exists on the media, so an `en-US` default would break every non-English ISO. Pass `--locale` only to override, and `--input-locale` if the keyboard layout should differ from the system locale. If you pass a `--locale` the media does not carry, the script warns before building rather than letting Setup stall on the language page.
+
+The Remote Desktop firewall rule is enabled through the `@FirewallAPI.dll,-28752` indirect reference rather than the display name `"Remote Desktop"`, which is localised and would not match on a non-English install.
+
+One caveat: `groups=Administrators` in the Cloudbase-Init config is a literal group name. It only comes into play when `--ci-username` names an account that does not already exist, and on a localised Windows the local group is `Administradores`, `Администраторы`, and so on. The default `--ci-username Administrator` is already a member of the group, so the common path is unaffected.
+
 **Usage:**
 
 ```bash
@@ -361,8 +373,11 @@ pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --d
 | `--build-bridge NAME` | Bridge for the build VM — an uplink-less one is recommended | `--bridge` |
 | `-D, --disk-size GB` | OS disk size | `60` |
 | `--product-key KEY` / `--kms` | Activation; omitting both is valid (deferred activation) | none |
+| `--kms-host HOST[:PORT]` | Point clones at a KMS server and let Cloudbase-Init activate them | none |
+| `--locale TAG` / `--input-locale TAG` | System locale / keyboard layout | the media's own language |
 | `--admin-password PW` | Administrator password | random, printed once |
 | `--no-tpm` / `--no-secureboot` | Drop the TPM 2.0 volume / pre-enrolled Secure Boot keys | both on |
+| `--no-rdp` | Do not enable Remote Desktop in the template | RDP enabled |
 | `--keep-on-failure` | Leave the build VM in place for inspection | off |
 | `-m, --mode`, `-S, --server` | Local vs. remote execution | local |
 | `--dry-run`, `--help`, `--version` | Repo-wide conventions | — |
@@ -377,6 +392,8 @@ pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --d
 6. Verify offline that `Sysprep_succeeded.tag` exists on the disk, detach every CD-ROM, attach the cloud-init drive, `qm template`
 
 Everything installed in the guest — virtio drivers, QEMU guest agent, SPICE agent and Cloudbase-Init — is staged from the host onto the answer ISO. The build VM never downloads anything, so an air-gapped node builds exactly the same template as a connected one.
+
+Remote Desktop is enabled with its firewall rule as part of step 5 (`--no-rdp` to skip). Each in-guest installer runs under its own timeout, so a hung installer degrades to a warning instead of stalling the build; progress is reported live from the guest through the QEMU agent.
 
 ### Cloud-init on Windows
 

@@ -220,7 +220,7 @@ _pve_build_windows_template() {
           -s --storage --iso-storage -B --bridge --vlan --build-bridge
           -D --disk-size -c --cpu-type --cores --memory
           --build-cores --build-memory --vga --no-tpm --no-secureboot
-          --locale --input-locale --timezone
+          --locale --input-locale --timezone --kms-host --no-rdp
           --admin-password --admin-password-file --ci-username
           --product-key --product-key-file --kms
           --cache-dir --refresh-cache --keep-answer-iso --keep-on-failure
@@ -256,7 +256,7 @@ _pve_build_windows_template() {
             return ;;
         --locale|--input-locale|--timezone|--admin-password|--ci-username)
             return ;;
-        --product-key|-S|--server)
+        --product-key|--kms-host|-S|--server)
             return ;;
         --install-timeout|--payload-timeout|--sysprep-timeout)
             return ;;

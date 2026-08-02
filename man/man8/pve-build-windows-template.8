@@ -1,7 +1,7 @@
 .\" pve-build-windows-template - Build sysprepped Windows Server templates on Proxmox VE
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-02" "1.0.0" "Proxmox VE Tools"
+.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-02" "1.1.0" "Proxmox VE Tools"
 
 .SH NAME
 pve\-build\-windows\-template \- build sysprepped, cloud\-init\-capable Windows Server templates on Proxmox VE
@@ -210,23 +210,35 @@ Do not attach a TPM 2.0 state volume.
 .TP
 .B \-\-no\-secureboot
 Do not pre\-enrol the Microsoft Secure Boot keys.
+.TP
+.B \-\-no\-rdp
+Do not enable Remote Desktop. By default the template has Remote Desktop
+switched on with its firewall rule opened.
 
 .SS Windows configuration
 .TP
 .BI \-\-locale " TAG"
-System and UI locale. Default:
-.BR en\-US .
+System and UI locale. Defaults to the language of the supplied media, read
+from the WIM
+.IR "Default Language" .
+See
+.BR "LANGUAGE SUPPORT" .
 .TP
 .BI \-\-input\-locale " TAG"
 Keyboard layout. Defaults to
 .BR \-\-locale .
 .TP
 .BI \-\-timezone " TZ"
-Windows time zone name. Default:
-.BR UTC ,
-matched by
-.B \-\-localtime 0
-on the VM so the RTC and the guest clock agree.
+Windows time zone name (these identifiers are language\-invariant). Default:
+.BR UTC .
+With
+.B UTC
+the VM is given an RTC in UTC
+.RB ( "\-\-localtime 0" )
+and Cloudbase\-Init is told the same through
+.IR real_time_clock_utc ,
+so the two agree. Any other zone keeps PVE's default local\-time RTC, which
+is what Windows expects.
 .TP
 .BI \-\-admin\-password " PW" "\fR, \fP" \-\-admin\-password\-file " FILE"
 Administrator password. When neither is given a random 18\-character password
@@ -246,6 +258,11 @@ Operator\-supplied key, embedded in the answer file and masked in all output.
 .B \-\-kms
 Use the public Microsoft KMS client setup key (GVLK) for this release and SKU.
 Rejected on evaluation media, where a GVLK cannot activate.
+.TP
+.BI \-\-kms\-host " HOST[:PORT]"
+Record a KMS server in the Cloudbase\-Init configuration so clones activate
+against it on first boot. The GVLK itself is still baked in at build time by
+.BR \-\-kms .
 
 .SS Caching, timeouts and diagnostics
 .TP
@@ -293,6 +310,51 @@ Show usage.
 .TP
 .BR \-v ", " \-\-version
 Print the script version.
+
+.SH LANGUAGE SUPPORT
+Any Windows Server localisation is supported with no extra arguments.
+.TP
+.B Edition selection is language\-invariant
+The script matches the WIM
+.I Name
+field, which Microsoft does not localise \(em Spanish media still reports
+.IR "Windows Server 2025 SERVERSTANDARDCORE" .
+The localised strings live in
+.IR "Display Name" ,
+which the script deliberately ignores.
+.TP
+.B The release comes from the NT build number
+.IR 17763 " \(-> 2019, " 20348 " \(-> 2022, " 26100 " \(-> 2025,"
+rather than an English product string.
+.B \-\-release
+overrides it.
+.TP
+.B \-\-locale defaults to the media's own language
+Read from the WIM
+.IR "Default Language" .
+.I SetupUILanguage
+must name a language present on the media, so a fixed
+.B en\-US
+default would break every non\-English ISO. Passing a
+.B \-\-locale
+the media does not carry produces a warning before the build starts.
+.TP
+.B The Remote Desktop firewall rule uses an indirect reference
+.I @FirewallAPI.dll,\-28752
+rather than the display name
+.RB \(dq "Remote Desktop" \(dq,
+which is localised and would not match on a non\-English install.
+.PP
+One caveat:
+.I groups=Administrators
+in the Cloudbase\-Init configuration is a literal group name, and on a
+localised Windows the local group is
+.IR Administradores ", " Администраторы
+and so on. It is only consulted when
+.B \-\-ci\-username
+names an account that does not already exist; the default
+.B Administrator
+is already a member, so the common path is unaffected.
 
 .SH CLOUD-INIT ON WINDOWS
 Proxmox VE presents cloud\-init to Windows guests as an OpenStack config\-drive
