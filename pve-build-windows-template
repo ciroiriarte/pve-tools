@@ -1603,33 +1603,77 @@ vm_block_bytes() {
 # So press only when the VM is demonstrably parked. Block I/O is flat at a
 # firmware prompt and busy throughout Setup, so twenty seconds without a
 # single byte moving means we are sitting at a prompt, not installing.
+# Answer the initial boot-from-CD prompt, gated on real I/O rather than a
+# guessed duration.
+#
+# The prompt is only offered for about five seconds and, once it lapses, the
+# firmware shows "No bootable option or device was found" where Enter opens
+# the Boot Manager instead of booting -- so the first press has to land
+# early. Detecting the prompt by watching for idle I/O cannot do that: it
+# needs ~25s to conclude the VM is idle, by which time the offer is long
+# gone. That is exactly how two parallel builds died.
+#
+# So press from the start, and stop the moment the media actually begins
+# being read: a boot moves tens of megabytes within seconds, while sitting
+# at the prompt moves nothing. That halts the presses during WinPE load,
+# well before Setup has a cancellable dialog on screen.
+press_boot_prompt() {
+    local vmid="$1" base cur i
+    base=$(vm_block_bytes "$vmid")
+    msg "Answering the boot-from-CD prompt"
+    for (( i = 0; i < 120; i++ )); do
+        echo "sendkey ret" | qm monitor "$vmid" >/dev/null 2>&1 || true
+        if (( i % 5 == 0 )); then
+            cur=$(vm_block_bytes "$vmid")
+            if (( cur > base + 20971520 )); then
+                ok "  boot media accepted (after ~$(( i + 1 )) press(es))"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    warn "Boot media never started reading; the VM may be stuck in firmware"
+}
+
 wait_for_setup() {
     local vmid="$1" timeout="$2"
-    local elapsed=0 idle=0 last=-1 bytes presses=0
+    local idle=0 last=-1 bytes presses=0
+    # Wall clock, not an assumed loop period: each qm monitor call costs
+    # over a second, so counting iterations stretched a 5400s timeout to
+    # 190 real minutes.
+    local start_ts elapsed=0 reported=0
+    start_ts=$(date +%s)
 
     while (( elapsed < timeout )); do
+        elapsed=$(( $(date +%s) - start_ts ))
         qm guest cmd "$vmid" ping &>/dev/null && {
             (( presses )) && ok "  answered the boot prompt ${presses} time(s)"
             return 0
         }
 
+        # Setup's mid-install reboot offers the boot prompt a second time,
+        # after press_boot_prompt() has finished. Nudge it whenever the VM
+        # has been completely idle for a while: Setup always moves bytes,
+        # a firmware prompt never does.
         bytes=$(vm_block_bytes "$vmid")
         if [[ "$bytes" == "$last" ]]; then
-            (( idle += 5 ))
+            (( idle++ )) || true
         else
             idle=0
             last="$bytes"
         fi
 
-        if (( idle >= 20 )); then
+        if (( idle >= 4 )); then
             echo "sendkey ret" | qm monitor "$vmid" >/dev/null 2>&1 || true
             (( presses++ )) || true
             idle=0
         fi
 
         sleep 5
-        (( elapsed += 5 ))
-        (( elapsed % 300 )) || ok "  still installing... (${elapsed}s / ${timeout}s)"
+        if (( elapsed - reported >= 300 )); then
+            reported=$elapsed
+            ok "  still installing... (${elapsed}s / ${timeout}s)"
+        fi
     done
     return 1
 }
@@ -1954,6 +1998,7 @@ build_one() {
     fi
 
     run qm start "$vmid"
+    press_boot_prompt "$vmid"
 
     msg "Waiting for Windows Setup to finish (timeout ${INSTALL_TIMEOUT}s)"
     wait_for_setup "$vmid" "$INSTALL_TIMEOUT" || \
