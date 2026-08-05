@@ -215,7 +215,7 @@ _pve_build_windows_template() {
     local cur prev opts
     _init_completion || return
 
-    opts="-i --iso --eval -R --release --virtio-iso --cloudbase-msi --spice-exe
+    opts="-i --iso --eval -R --release --virtio-iso --cloudbase-msi --spice-msi
           -e --edition -k --sku -I --start-id --force
           -s --storage --iso-storage -B --bridge --vlan --build-bridge
           -D --disk-size -c --cpu-type --cores --memory
@@ -243,8 +243,8 @@ _pve_build_windows_template() {
             _filedir iso; return ;;
         --cloudbase-msi)
             _filedir msi; return ;;
-        --spice-exe)
-            _filedir exe; return ;;
+        --spice-msi)
+            _filedir msi; return ;;
         --admin-password-file|--product-key-file)
             _filedir; return ;;
         --cache-dir)

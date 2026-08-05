@@ -24,8 +24,8 @@
 #      override with --virtio-iso for air-gapped sites).
 #   3. Stages every in-guest payload ON THE HOST and bakes it into a small
 #      generated answer ISO: the virtio drivers (flattened), the QEMU guest
-#      agent MSI (extracted from the virtio ISO), spice-guest-tools and the
-#      Cloudbase-Init MSI.  The build VM therefore needs NO internet access.
+#      agent MSI (extracted from the virtio ISO), the SPICE vdagent MSI and
+#      the Cloudbase-Init MSI.  The build VM therefore needs NO internet access.
 #   4. Generates Autounattend.xml driving a fully unattended UEFI/GPT install:
 #      virtio storage + NIC driver injection so Setup sees the disk, edition
 #      selection, locale/timezone/admin password, then a SetupComplete.cmd
@@ -50,7 +50,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 set -euo pipefail
 
@@ -150,7 +150,7 @@ CI_USERNAME="Administrator"
 
 VIRTIO_ISO=""                 # --virtio-iso override
 CLOUDBASE_MSI=""              # --cloudbase-msi override
-SPICE_EXE=""                  # --spice-exe override
+SPICE_MSI=""                  # --spice-msi override
 
 CACHE_DIR=""                  # payload cache; default derived from ISO storage
 REFRESH_CACHE=0
@@ -166,7 +166,16 @@ SYSPREP_TIMEOUT=1800          # reboot + sysprep -> powered off
 # Microsoft Windows media).
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 CLOUDBASE_URL="https://cloudbase.it/downloads/CloudbaseInitSetup_Stable_x64.msi"
-SPICE_URL="https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe"
+# The SPICE agent alone, not the spice-guest-tools bundle.  That bundle was
+# last built in January 2018 and carries virtio-win 0.1.141 inside it: its
+# NSIS script forks that ancient driver MSI, which wedges indefinitely on
+# Server 2019/2022/2025 and, if it ever completed, would downgrade the
+# 0.1.285 storage and network drivers underneath a running system.  The
+# standalone MSI is agent-only, installs with /qn, and is a version newer
+# (0.10.0 vs 0.9.0).  Upstream publishes no "latest" alias here, so the
+# version is pinned; override with --spice-msi.
+SPICE_VDAGENT_VERSION="0.10.0"
+SPICE_URL="https://www.spice-space.org/download/windows/vdagent/vdagent-win-${SPICE_VDAGENT_VERSION}/spice-vdagent-x64-${SPICE_VDAGENT_VERSION}.msi"
 
 # Internal state (set during execution)
 TIMESTAMP=$(date +%Y%m%d%H%M)
@@ -178,7 +187,7 @@ ISO_DIR=""                    # <iso-storage>/template/iso
 WIN_ISO_PATH=""               # resolved absolute path to the Windows ISO
 VIRTIO_ISO_PATH=""
 CLOUDBASE_MSI_PATH=""
-SPICE_EXE_PATH=""
+SPICE_MSI_PATH=""
 IMAGE_NAME=""                 # exact /IMAGE/NAME for the current edition
 IS_EVAL_MEDIA=0
 VIRTIO_VERSION=""
@@ -572,9 +581,9 @@ fetch_cloudbase_msi() {
     download_file "$CLOUDBASE_URL" "$CLOUDBASE_MSI_PATH" "Cloudbase-Init (${name})"
 }
 
-fetch_spice_tools() {
-    SPICE_EXE_PATH="${CACHE_DIR}/spice-guest-tools.exe"
-    download_file "$SPICE_URL" "$SPICE_EXE_PATH" "spice-guest-tools"
+fetch_spice_agent() {
+    SPICE_MSI_PATH="${CACHE_DIR}/spice-vdagent-x64.msi"
+    download_file "$SPICE_URL" "$SPICE_MSI_PATH" "SPICE agent ${SPICE_VDAGENT_VERSION}"
 }
 
 # --- Media inspection ---------------------------------------------------------
@@ -754,8 +763,8 @@ stage_payloads() {
         warn "virtio-win-gt-x64.msi not on the virtio ISO — relying on Setup driver injection only"
     fi
     stage_copy "$CLOUDBASE_MSI_PATH" "${STAGE_DIR}/pvebuild/CloudbaseInitSetup_x64.msi"
-    stage_copy "$SPICE_EXE_PATH"     "${STAGE_DIR}/pvebuild/spice-guest-tools.exe"
-    ok "Staged in-guest payloads (qemu-ga, virtio-win-gt, Cloudbase-Init, spice-guest-tools)"
+    stage_copy "$SPICE_MSI_PATH"     "${STAGE_DIR}/pvebuild/spice-vdagent-x64.msi"
+    ok "Staged in-guest payloads (qemu-ga, virtio-win-gt, Cloudbase-Init, SPICE agent)"
 }
 
 # The <ProductKey> block for the windowsPE pass.  Empty unless the operator
@@ -1079,12 +1088,14 @@ EOF
 # MSI installs leave PendingFileRenameOperations behind and sysprep
 # /generalize refuses to run while a reboot is pending.
 #
-# Every installer is bounded by RunTimed().  spice-guest-tools in particular
-# has been observed hanging indefinitely under /S — it is an NSIS bundle and
-# the QXL WDDM driver it carries has no INF for Server 2022/2025.  Its
-# outcome is advisory (the vdagent service is what we want), so a hang must
-# degrade to SPICE-WARN rather than silently consuming the whole payload
-# budget and failing the build.
+# Every installer is bounded by RunTimed(), which is what kept the old
+# spice-guest-tools bundle from doing damage: that NSIS installer forks a
+# virtio-win 0.1.141 MSI from 2018, which hangs on Server 2019/2022/2025 and
+# would downgrade the 0.1.285 drivers installed moments earlier if it ever
+# finished.  The standalone vdagent MSI replaces it and exits 0 in seconds.
+# The outcome stays advisory (a template without a SPICE agent is still a
+# working template) but it is now reported honestly rather than warned about
+# on every single run.
 generate_setupcomplete_ps1() {
     cat > "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
 # Generated by pve-build-windows-template. Runs as LocalSystem before logon.
@@ -1110,6 +1121,18 @@ function RunTimed([string]$file, [string[]]$argv, [int]$sec) {
     return $p.ExitCode
 }
 
+# The distinct set of virtio driver versions currently bound.  Compared before
+# and after the remaining payload installs: an installer that ships its own
+# drivers can silently downgrade the ones we just installed, which is exactly
+# what the old spice-guest-tools bundle (virtio-win 0.1.141, 2018) would have
+# done had it not been killed on timeout.  Comparing the version SET rather
+# than per-device strings avoids a false positive when a device is added.
+function VirtioVersions {
+    ((Get-WmiObject Win32_PnPSignedDriver |
+        Where-Object { $_.DeviceName -match 'VirtIO' } |
+        ForEach-Object { $_.DriverVersion }) | Sort-Object -Unique) -join ','
+}
+
 Mark 'STARTED'
 
 # Wait until Setup has released the machine.
@@ -1128,6 +1151,8 @@ if (Test-Path -LiteralPath "$PL\virtio-win-gt-x64.msi") {
 } else {
     Mark 'VIRTIO-SKIP'
 }
+$VirtioBaseline = VirtioVersions
+Mark "VIRTIO-VER($VirtioBaseline)"
 
 $rc = RunTimed 'msiexec.exe' @('/i', "$PL\qemu-ga-x86_64.msi", '/qn',
                                '/norestart', '/l*v', "$PL\qemuga.log") 900
@@ -1136,13 +1161,31 @@ Mark $(if ($rc -eq 0) { 'QEMUGA-OK' } else { "QEMUGA-FAIL($rc)" })
 Start-Service QEMU-GA -ErrorAction SilentlyContinue
 
 # Advisory; see the comment on generate_setupcomplete_ps1.
-$rc = RunTimed "$PL\spice-guest-tools.exe" @('/S') 300
-Mark $(if ($rc -eq 0) { 'SPICE-OK' } else { "SPICE-WARN($rc)" })
+$rc = RunTimed 'msiexec.exe' @('/i', "$PL\spice-vdagent-x64.msi", '/qn',
+                               '/norestart', '/l*v', "$PL\spice.log") 300
+# vdservice only stays *running* while a SPICE display is attached, and the
+# build VM uses --vga std, so asserting Running here would fail on a
+# correctly installed agent.  Assert registration and automatic start.
+$svc = Get-CimInstance Win32_Service -Filter "Name='spice-agent'" -ErrorAction SilentlyContinue
+if ($rc -eq 0 -and $svc -and $svc.StartMode -eq 'Auto') {
+    Mark 'SPICE-OK'
+} else {
+    $st = if ($svc) { $svc.StartMode } else { 'absent' }
+    Mark "SPICE-WARN(rc=$rc,svc=$st)"
+}
 
 $rc = RunTimed 'msiexec.exe' @('/i', "$PL\CloudbaseInitSetup_x64.msi", '/qn',
                                '/norestart', 'RUN_SERVICE_AS_LOCAL_SYSTEM=1',
                                '/l*v', "$PL\cloudbase.log") 900
 Mark $(if ($rc -eq 0) { 'CBI-OK' } else { "CBI-FAIL($rc)" })
+
+# Nothing installed after the virtio drivers may change them.
+$VirtioAfter = VirtioVersions
+if ($VirtioBaseline -and $VirtioAfter -ne $VirtioBaseline) {
+    Mark "VIRTIO-CHANGED(before=$VirtioBaseline,after=$VirtioAfter)"
+} else {
+    Mark 'VIRTIO-STABLE'
+}
 
 # Resolve the built-in administrator and the local administrators group from
 # their well-known SIDs rather than trusting the English names: both are
@@ -1737,8 +1780,17 @@ check_payload_failures() {
             die "Payload installation reported ${marker}. The per-installer log is on the build disk under C:\\pvebuild\\*.log — re-run with --keep-on-failure to read it."
         fi
     done
+    # A driver downgrade is fatal, not advisory: the template would boot but
+    # ship older storage/network drivers than the ones requested, and the
+    # divergence would be invisible for the life of every clone.
+    if grep -q '^VIRTIO-CHANGED' <<< "$GUEST_STATE"; then
+        err "In-guest step failed: $(grep '^VIRTIO-CHANGED' <<< "$GUEST_STATE" | head -1)"
+        die "A payload installed after the virtio drivers changed them. The template would carry drivers other than the virtio-win set requested; refusing to seal it."
+    fi
     if grep -q '^SPICE-WARN' <<< "$GUEST_STATE"; then
-        warn "spice-guest-tools did not install cleanly ($(grep '^SPICE-WARN' <<< "$GUEST_STATE" | head -1)) — continuing, the SPICE agent is advisory"
+        warn "SPICE agent NOT installed ($(grep '^SPICE-WARN' <<< "$GUEST_STATE" | head -1))."
+        warn "The template is usable; clones lose SPICE clipboard sharing and display auto-resize."
+        warn "Read C:\\pvebuild\\spice.log on the build disk with --keep-on-failure to diagnose"
     fi
 }
 
@@ -1863,7 +1915,7 @@ Built by pve-build-windows-template ${VERSION} on $(hostname) at $(date -Is)
   Source ISO     : $(basename "$WIN_ISO_PATH")
   virtio-win     : ${VIRTIO_VERSION}
   Cloudbase-Init : $(basename "$CLOUDBASE_MSI_PATH")
-  SPICE tools    : $(basename "$SPICE_EXE_PATH")
+  SPICE agent    : $(basename "$SPICE_MSI_PATH")$(grep -q '^SPICE-OK' <<< "${GUEST_STATE:-}" && echo " (installed)" || echo " (NOT INSTALLED)")
   Activation     : $( (( USE_KMS )) && echo "KMS (GVLK)" || { [[ -n "$PRODUCT_KEY" ]] && echo "operator-supplied product key" || echo "none - deferred activation"; } )
 
 Cloning:
@@ -2091,7 +2143,7 @@ delegate_to_server() {
     rcmd+=( --sysprep-timeout "$SYSPREP_TIMEOUT" )
     [[ -n "$VIRTIO_ISO" ]]    && rcmd+=( --virtio-iso "$VIRTIO_ISO" )
     [[ -n "$CLOUDBASE_MSI" ]] && rcmd+=( --cloudbase-msi "$CLOUDBASE_MSI" )
-    [[ -n "$SPICE_EXE" ]]     && rcmd+=( --spice-exe "$SPICE_EXE" )
+    [[ -n "$SPICE_MSI" ]]     && rcmd+=( --spice-msi "$SPICE_MSI" )
     [[ -n "$CACHE_DIR" ]]     && rcmd+=( --cache-dir "$CACHE_DIR" )
     (( USE_KMS ))          && rcmd+=( --kms )
     (( USE_TPM ))          || rcmd+=( --no-tpm )
@@ -2151,7 +2203,7 @@ ${C_BOLD}Media${C_RESET} (Windows media is never downloaded unless you ask for -
   -R, --release REL        2019|2022|2025      [auto-detected from the media]
       --virtio-iso PATH    Use this virtio-win ISO instead of downloading
       --cloudbase-msi PATH Use this Cloudbase-Init MSI instead of downloading
-      --spice-exe PATH     Use this spice-guest-tools.exe instead of downloading
+      --spice-msi PATH     Use this SPICE vdagent MSI instead of downloading
 
 ${C_BOLD}What to build:${C_RESET}
   -e, --edition WHICH      core|desktop|both                        [both]
@@ -2254,7 +2306,7 @@ main() {
             -R|--release)          RELEASE="$2";             shift 2 ;;
             --virtio-iso)          VIRTIO_ISO="$2";          shift 2 ;;
             --cloudbase-msi)       CLOUDBASE_MSI="$2";       shift 2 ;;
-            --spice-exe)           SPICE_EXE="$2";           shift 2 ;;
+            --spice-msi)           SPICE_MSI="$2";           shift 2 ;;
             # --- what to build ---
             -e|--edition)          EDITION="$2";             shift 2 ;;
             -k|--sku)              SKU="$2";                 shift 2 ;;
@@ -2426,12 +2478,12 @@ main() {
         fetch_cloudbase_msi
     fi
 
-    if [[ -n "$SPICE_EXE" ]]; then
-        [[ -f "$SPICE_EXE" ]] || die "spice-guest-tools not found: $SPICE_EXE"
-        SPICE_EXE_PATH="$SPICE_EXE"
-        ok "spice-guest-tools: $(basename "$SPICE_EXE_PATH")"
+    if [[ -n "$SPICE_MSI" ]]; then
+        [[ -f "$SPICE_MSI" ]] || die "SPICE agent MSI not found: $SPICE_MSI"
+        SPICE_MSI_PATH="$SPICE_MSI"
+        ok "SPICE agent: $(basename "$SPICE_MSI_PATH")"
     else
-        fetch_spice_tools
+        fetch_spice_agent
     fi
 
     # ==== STEP 2: inspect the Windows media once ==============================

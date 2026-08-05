@@ -310,7 +310,7 @@ In remote mode the script copies itself to the node and re-executes there. Nothi
 
 The script **never** downloads, caches or redistributes Windows media or a licence key. You supply the ISO with `--iso`. The single exception is opt-in: `--eval 2019|2022|2025` downloads Microsoft's freely-redistributable 180-day evaluation media from the Microsoft Evaluation Center.
 
-Only the redistributable payloads — the virtio-win driver ISO, spice-guest-tools and Cloudbase-Init — are fetched automatically, and each can be overridden with `--virtio-iso`, `--spice-exe` and `--cloudbase-msi` for air-gapped sites.
+Only the redistributable payloads — the virtio-win driver ISO, the SPICE agent MSI and Cloudbase-Init — are fetched automatically, and each can be overridden with `--virtio-iso`, `--spice-msi` and `--cloudbase-msi` for air-gapped sites.
 
 Product keys never appear in `--dry-run` output, in diagnostics, or in any process table.
 
@@ -384,7 +384,7 @@ pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --d
 
 **Workflow:**
 
-1. Resolve the Windows media, virtio-win ISO, Cloudbase-Init MSI and spice-guest-tools, caching each under the ISO storage
+1. Resolve the Windows media, virtio-win ISO, Cloudbase-Init MSI and SPICE agent MSI, caching each under the ISO storage
 2. Mount the Windows media (UDF) and read the image list with `wiminfo` — auto-detect the release, detect evaluation media, resolve the exact `/IMAGE/NAME` for the requested SKU and edition
 3. Flatten the release-specific virtio drivers and stage **every** in-guest payload onto a generated answer ISO — the build VM needs no network access at all
 4. Create the build VM (`ovmf` + `q35` + `virtio-scsi-single` + TPM 2.0 + Secure Boot) and start it
@@ -419,9 +419,9 @@ qm start 130
 - Windows Server only — desktop Windows editions are not supported
 - UEFI/GPT only; no BIOS/MBR installs
 - Domain join at build time is out of scope — it belongs at clone time
-- Single NIC only. PVE's Windows config-drive writes the network configuration as Debian ENI with no MAC address, so the interface mapping is ambiguous with more than one NIC
+- Cloud-init IP assignment across multiple NICs is not guaranteed by the format. PVE's Windows config-drive writes the network configuration as Debian ENI with no MAC address (`cloudbase_network_eni()`), so Cloudbase-Init has to match `eth0`/`eth1` to Windows adapters by enumeration order rather than identity. Two NICs mapped correctly in testing, but nothing in the format promises it. Adding NICs to a clone is otherwise unrestricted — only cloud-init's automatic addressing is affected, and NICs you configure by other means (DHCP, or in-guest) are unaffected
 - Cloudbase-Init is always installed; there is no `--no-cloudbase-init` escape hatch in this release
-- The virtio-win `qxldod` display driver has no INF for Server 2022 or 2025, so `--vga std` is the default. spice-guest-tools (and the vdagent service) is installed regardless — the display type is a clone-time decision via `qm set <id> --vga qxl`
+- The virtio-win `qxldod` display driver has no INF for Server 2022 or 2025, so `--vga std` is the default. The SPICE agent is installed regardless — the display type is a clone-time decision via `qm set <id> --vga qxl`. The `spice-agent` service is registered `Automatic` but only runs while a SPICE display is attached, so it reads `Stopped` on a `--vga std` clone; that is correct, not a failed install
 - The virtio-win ISO must be new enough for the target release; the script refuses to build rather than producing a broken template
 
 **Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `genisoimage` (or `mkisofs`), `wiminfo` (wimtools), `guestfish` (libguestfs-tools), `curl`, `python3`.

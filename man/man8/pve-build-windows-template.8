@@ -1,7 +1,7 @@
 .\" pve-build-windows-template - Build sysprepped Windows Server templates on Proxmox VE
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-02" "1.1.0" "Proxmox VE Tools"
+.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-04" "1.2.0" "Proxmox VE Tools"
 
 .SH NAME
 pve\-build\-windows\-template \- build sysprepped, cloud\-init\-capable Windows Server templates on Proxmox VE
@@ -50,7 +50,7 @@ supplies the ISO with
 The single exception is opt\-in: passing
 .B \-\-eval
 downloads Microsoft's freely\-redistributable 180\-day evaluation media from the
-Microsoft Evaluation Center. Only the virtio\-win driver ISO, spice\-guest\-tools
+Microsoft Evaluation Center. Only the virtio\-win driver ISO, the SPICE agent MSI
 and Cloudbase\-Init \(em all redistributable \(em are fetched automatically, and
 each can be overridden for air\-gapped sites.
 .PP
@@ -80,7 +80,7 @@ are needed on the jump host.
 .SS Build sequence
 .IP 1. 4
 Resolve the Windows media, the virtio\-win ISO, the Cloudbase\-Init MSI and
-spice\-guest\-tools, caching each under the ISO storage.
+the SPICE agent MSI, caching each under the ISO storage.
 .IP 2. 4
 Mount the Windows media (UDF) and read the image list with
 .BR wiminfo (1)
@@ -131,8 +131,10 @@ Use this virtio\-win ISO instead of downloading the stable build.
 .BI \-\-cloudbase\-msi " PATH"
 Use this Cloudbase\-Init MSI instead of downloading it.
 .TP
-.BI \-\-spice\-exe " PATH"
-Use this spice\-guest\-tools installer instead of downloading it.
+.BI \-\-spice\-msi " PATH"
+Use this SPICE vdagent MSI instead of downloading it. The default is
+spice\-vdagent\-x64\-0.10.0.msi from spice\-space.org; upstream publishes no
+"latest" alias for it, so the version is pinned.
 
 .SS What to build
 .TP
@@ -463,7 +465,7 @@ Downloaded evaluation and virtio\-win ISOs, and the generated
 .BR \-\-keep\-answer\-iso ).
 .TP
 .IR <iso\-storage> /pve\-tools\-cache/windows\-templates/
-Cloudbase\-Init and spice\-guest\-tools installers. Override with
+Cloudbase\-Init and SPICE agent installers. Override with
 .BR \-\-cache\-dir .
 .TP
 .I C:\e\epvebuild\e\estate.txt
@@ -511,9 +513,15 @@ UEFI/GPT only. BIOS/MBR installs are not supported.
 .IP \(bu 2
 Domain join at build time is out of scope; it belongs at clone time.
 .IP \(bu 2
-Single NIC only. PVE's Windows config\-drive writes the network configuration
-as Debian ENI with no MAC address, so the interface mapping is ambiguous with
-more than one NIC.
+Cloud\-init IP assignment across multiple NICs is not guaranteed. PVE's Windows
+config\-drive writes the network configuration as Debian ENI with no MAC address
+.RB ( cloudbase_network_eni ),
+so Cloudbase\-Init matches
+.BR eth0 / eth1
+to Windows adapters by enumeration order rather than by identity. Two NICs
+mapped correctly in testing, but the format does not promise it. Adding NICs to
+a clone is otherwise unrestricted: only cloud\-init's automatic addressing is
+affected, and NICs configured by other means are unaffected.
 .IP \(bu 2
 Cloudbase\-Init is always installed; there is no
 .B \-\-no\-cloudbase\-init
@@ -523,9 +531,17 @@ The virtio\-win
 .B qxldod
 display driver has no INF for Server 2022 or 2025, so
 .B \-\-vga std
-is the default. spice\-guest\-tools (and therefore the vdagent service) is
-installed regardless \(em the display type is a clone\-time decision made with
+is the default. The SPICE agent is installed regardless \(em the display type is
+a clone\-time decision made with
 .BR "qm set <id> \-\-vga qxl" .
+Note that the
+.B spice\-agent
+service is registered to start automatically but only stays running while a
+SPICE display is actually attached, so it reads
+.B Stopped
+on a
+.B \-\-vga std
+clone. That is correct behaviour, not a failed install.
 .IP \(bu 2
 The virtio\-win ISO must be new enough for the target release. The script
 refuses to build rather than producing a broken template.
