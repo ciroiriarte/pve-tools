@@ -527,6 +527,13 @@ Cloudbase\-Init is always installed; there is no
 .B \-\-no\-cloudbase\-init
 escape hatch in this release.
 .IP \(bu 2
+On Server Core, Device Manager reports one undriveable
+.B PCI Device
+.RB ( 8086:293E ,
+the ICH9 HD Audio controller). PVE's q35 machine definition attaches it to
+every VM and Server Core ships no audio driver. It is cosmetic and is neither
+added nor removable by this script.
+.IP \(bu 2
 The virtio\-win
 .B qxldod
 display driver has no INF for Server 2022 or 2025, so

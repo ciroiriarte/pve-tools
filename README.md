@@ -423,6 +423,7 @@ qm start 130
 - Cloudbase-Init is always installed; there is no `--no-cloudbase-init` escape hatch in this release
 - The virtio-win `qxldod` display driver has no INF for Server 2022 or 2025, so `--vga std` is the default. The SPICE agent is installed regardless — the display type is a clone-time decision via `qm set <id> --vga qxl`. The `spice-agent` service is registered `Automatic` but only runs while a SPICE display is attached, so it reads `Stopped` on a `--vga std` clone; that is correct, not a failed install
 - The virtio-win ISO must be new enough for the target release; the script refuses to build rather than producing a broken template
+- On **Server Core**, Device Manager shows one undriveable `PCI Device` (`8086:293E`, the ICH9 HD Audio controller). PVE's q35 machine definition attaches it to every VM — see the `FIXME: Remove this audio0 device` in `/usr/share/qemu-server/pve-q35-4.0.cfg` — and Server Core ships no audio driver. It is cosmetic, affects any q35 Windows Server Core guest on PVE, and is not something this script adds or can remove
 
 **Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `genisoimage` (or `mkisofs`), `wiminfo` (wimtools), `guestfish` (libguestfs-tools), `curl`, `python3`.
 
