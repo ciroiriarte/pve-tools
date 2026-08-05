@@ -513,15 +513,25 @@ UEFI/GPT only. BIOS/MBR installs are not supported.
 .IP \(bu 2
 Domain join at build time is out of scope; it belongs at clone time.
 .IP \(bu 2
-Cloud\-init IP assignment across multiple NICs is not guaranteed. PVE's Windows
-config\-drive writes the network configuration as Debian ENI with no MAC address
-.RB ( cloudbase_network_eni ),
-so Cloudbase\-Init matches
-.BR eth0 / eth1
-to Windows adapters by enumeration order rather than by identity. Two NICs
-mapped correctly in testing, but the format does not promise it. Adding NICs to
-a clone is otherwise unrestricted: only cloud\-init's automatic addressing is
-affected, and NICs configured by other means are unaffected.
+Cloud\-init addressing is only reliable for a single NIC, or for several NICs of
+the same model. PVE's Windows config\-drive writes the network configuration as
+Debian ENI with no MAC address
+.RB ( cloudbase_network_eni ()
+in
+.IR PVE/QemuServer/Cloudinit.pm ),
+so Cloudbase\-Init assigns
+.BR \-\-ipconfig0 ,
+.BR \-\-ipconfig1 ,
+\&... in Windows adapter\-enumeration order rather than by identity. Two virtio
+NICs added in order enumerate in the same order and map correctly. Mixed models
+do not: a clone with
+.B net0
+e1000 plus
+.BR net1 / net2
+virtio received all three addresses rotated onto the wrong adapters, because
+Windows enumerates the virtio adapters ahead of the e1000. Give extra NICs their
+addresses by other means. Adding NICs, disks or other hardware to a clone is
+otherwise unrestricted; only cloud\-init's automatic addressing is affected.
 .IP \(bu 2
 Cloudbase\-Init is always installed; there is no
 .B \-\-no\-cloudbase\-init
