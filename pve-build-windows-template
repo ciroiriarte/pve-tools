@@ -50,7 +50,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 set -euo pipefail
 
@@ -1159,6 +1159,18 @@ $rc = RunTimed 'msiexec.exe' @('/i', "$PL\qemu-ga-x86_64.msi", '/qn',
 Mark $(if ($rc -eq 0) { 'QEMUGA-OK' } else { "QEMUGA-FAIL($rc)" })
 & sc.exe config QEMU-GA start= auto | Out-Null
 Start-Service QEMU-GA -ErrorAction SilentlyContinue
+
+# The vdagent MSI writes a Start Menu shortcut into the *current user's*
+# roaming profile.  This runs as LocalSystem, so that is systemprofile.
+# Measured across the full matrix: Server 2019 Core does not create the
+# Microsoft\Windows\Start Menu tree there, and the MSI dies with
+# 1805 -> 1603 and rolls back.  2019 Desktop, 2022 and 2025 (both editions)
+# all have it already, so this is a no-op there -- do not remove it after
+# testing only on a newer release.
+$SysMenu = Join-Path $env:SystemRoot 'system32\config\systemprofile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs'
+if (-not (Test-Path -LiteralPath $SysMenu)) {
+    New-Item -ItemType Directory -Force -Path $SysMenu -ErrorAction SilentlyContinue | Out-Null
+}
 
 # Advisory; see the comment on generate_setupcomplete_ps1.
 $rc = RunTimed 'msiexec.exe' @('/i', "$PL\spice-vdagent-x64.msi", '/qn',
