@@ -380,6 +380,7 @@ pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --d
 | `--admin-password PW` | Administrator password | random, printed once |
 | `--no-tpm` / `--no-secureboot` | Drop the TPM 2.0 volume / pre-enrolled Secure Boot keys | both on |
 | `--no-rdp` | Do not enable Remote Desktop in the template | RDP enabled |
+| `--addons DIR` / `--addon DIR` | Install operator-supplied software into the template (repeatable). See **Addons** below | none |
 | `--keep-on-failure` | Leave the build VM in place for inspection | off |
 | `-m, --mode`, `-S, --server` | Local vs. remote execution | local |
 | `--dry-run`, `--help`, `--version` | Repo-wide conventions | — |
@@ -417,6 +418,51 @@ qm set 130 --ipconfig0 ip=10.0.0.30/24,gw=10.0.0.1 --nameserver 10.0.0.1
 qm set 130 --cipassword 'secret' --sshkeys ~/.ssh/id_ed25519.pub
 qm start 130
 ```
+
+### Addons
+
+The core template ships the fixed payloads (virtio, guest agent, SPICE agent, Cloudbase-Init). To bake **additional software** into it — an AV or inventory agent, a portable toolset, an MSI your images "always" carry — point the builder at one or more addon directories:
+
+```bash
+pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 \
+    --addons ./samples/addons
+```
+
+`--addons DIR` accepts either a single addon (a directory containing an `addon.conf`) or a directory of addon sub-dirs run in sorted order — so the `10-`, `20-`, `30-` name prefixes control sequencing. The flag is repeatable; `--addon` is an alias. In remote mode the addon directories are copied to the node alongside the script. As with `--iso`, **no binary is ever downloaded or bundled**: you supply every installer.
+
+Worked examples live under [`samples/addons/`](samples/addons/): `10-7zip` (silent MSI), `20-sysinternals` (copy files + PATH), and `30-wazuh` (the two-phase agent below).
+
+**Two phases.** An addon can act at build time, at first boot of each clone, or both:
+
+1. **Build time** — the installer named by `type` runs inside the build VM after the core payloads and **before** sysprep, so the software is present in every clone. Progress lands in `C:\pvebuild\state.txt` as `ADDON-<name>-OK` / `-FAIL(rc)`, and each MSI logs to `C:\pvebuild\addon-<name>.log`.
+2. **First boot** — if the addon declares `firstboot=`, that script is baked into Cloudbase-Init's LocalScripts and runs **once per clone** (a clone gets a fresh cloud-init instance-id, so LocalScripts execute exactly once). This is where software gets its **per-instance identity** — the reason a template can't simply pre-enrol an agent: every clone must register as *itself*.
+
+**The `addon.conf` contract** (`KEY=VALUE`, `#` comments ignored):
+
+| Key | Applies to | Meaning |
+|-----|-----------|---------|
+| `type` | all | `msi` \| `exe` \| `copy` \| `script` (required) |
+| `file` | msi/exe/script | installer file, relative to the addon dir |
+| `args` | msi/exe/script | extra arguments (msi: appended after `/i FILE /qn /norestart`) |
+| `dest` | copy | Windows destination path (e.g. `C:\Tools`) |
+| `payload` | copy | source sub-dir to copy (default `payload`) |
+| `path_add` | copy | `1` appends `dest` to the system PATH |
+| `timeout` | msi/exe/script | seconds before the installer is killed (default `600`) |
+| `codes` | msi/exe/script | comma-separated success exit codes (default `0,3010`) |
+| `required` | all | `1` aborts the build on failure; default `0` (advisory — a failed optional addon only warns) |
+| `firstboot` | all | script baked into Cloudbase-Init LocalScripts, run once per clone |
+
+An addon that ships its own virtio drivers and downgrades the set installed earlier is caught and fails the build, the same guard the core payloads use.
+
+**Per-instance identity is your choice.** The `firstboot` hook is source-agnostic. A first-boot script can read its identity/config from:
+
+- **cloud-init user-data** on the PVE cloud-init drive — self-contained and air-gap friendly;
+- **PVE metadata** — the hostname (`--name`), instance-id and network PVE injects automatically (enough when an agent only needs a stable name);
+- **an external enrolment server** — call the management console for a per-VM token, keeping secrets off the cloud-init drive.
+
+The `30-wazuh` example demonstrates the whole path: the agent MSI is installed at build time with no manager, and `firstboot.ps1` enrols each clone under its own hostname on first boot. A well-behaved first-boot script **no-ops cleanly** when its configuration is absent, so a template cloned without settings still boots to a healthy VM.
+
+**Clone-time package managers.** For packages chosen *per clone* rather than baked into the image, drive a package manager from Cloudbase-Init user-data instead of an addon. [`samples/ci-userdata-chocolatey.yaml`](samples/ci-userdata-chocolatey.yaml) bootstraps Chocolatey and installs a per-VM package list at first boot via `UserDataPlugin`.
 
 **Limitations:**
 

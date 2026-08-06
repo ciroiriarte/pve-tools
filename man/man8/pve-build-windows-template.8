@@ -1,7 +1,7 @@
 .\" pve-build-windows-template - Build sysprepped Windows Server templates on Proxmox VE
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-05" "1.4.0" "Proxmox VE Tools"
+.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-05" "1.5.0" "Proxmox VE Tools"
 
 .SH NAME
 pve\-build\-windows\-template \- build sysprepped, cloud\-init\-capable Windows Server templates on Proxmox VE
@@ -135,6 +135,56 @@ Use this Cloudbase\-Init MSI instead of downloading it.
 Use this SPICE vdagent MSI instead of downloading it. The default is
 spice\-vdagent\-x64\-0.10.0.msi from spice\-space.org; upstream publishes no
 "latest" alias for it, so the version is pinned.
+
+.SS Addons
+.TP
+.BI \-\-addons " DIR" "\fR, \fP" \-\-addon " DIR"
+Install operator\-supplied software into the template.
+.I DIR
+is either a single addon (a directory containing an
+.IR addon.conf )
+or a directory of addon sub\-dirs, which run in sorted order so the
+.IR 10\- ", " 20\- ", " 30\- " name prefixes control sequencing."
+Repeatable. No binary is ever downloaded or bundled \(em the operator supplies
+every installer, the same stance as
+.BR \-\-iso .
+In remote mode the addon directories are copied to the node alongside the
+script.
+.IP
+Each addon carries an
+.I addon.conf
+.RI ( KEY = VALUE ,
+.RB ' # '
+comments ignored):
+.I type
+.RB ( msi " | " exe " | " copy " | " script ,
+required);
+.I file
+(installer, for msi/exe/script);
+.I args
+(extra installer arguments);
+.I dest
+and
+.I path_add
+(for
+.IR type = copy );
+.I timeout
+(seconds, default 600);
+.I codes
+(success exit codes, default
+.IR 0,3010 );
+.I required
+.RB ( 1
+aborts the build on failure; default
+.I 0
+is advisory); and
+.I firstboot
+(a script baked into Cloudbase\-Init's LocalScripts and run once on each
+clone's first boot, where per\-instance identity is applied). See the
+.B Addons
+section of the README and
+.I samples/addons
+for worked examples.
 
 .SS What to build
 .TP

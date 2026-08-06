@@ -1,0 +1,7 @@
+# Addon binaries are operator-supplied and must never be committed
+# (see README.md — no redistribution). Only the addon.conf, READMEs, the
+# firstboot scripts and payload/.gitkeep are tracked.
+*.msi
+*.exe
+*.zip
+*.cab

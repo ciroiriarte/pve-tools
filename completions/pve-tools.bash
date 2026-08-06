@@ -216,6 +216,7 @@ _pve_build_windows_template() {
     _init_completion || return
 
     opts="-i --iso --eval -R --release --virtio-iso --cloudbase-msi --spice-msi
+          --addons --addon
           -e --edition -k --sku -I --start-id --force
           -s --storage --iso-storage -B --bridge --vlan --build-bridge
           -D --disk-size -c --cpu-type --cores --memory
@@ -247,7 +248,7 @@ _pve_build_windows_template() {
             _filedir msi; return ;;
         --admin-password-file|--product-key-file)
             _filedir; return ;;
-        --cache-dir)
+        --cache-dir|--addons|--addon)
             _filedir -d; return ;;
         -s|--storage|--iso-storage|-B|--bridge|--vlan|--build-bridge|-I|--start-id)
             # Expects a value; no useful default completions

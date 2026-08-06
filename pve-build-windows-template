@@ -50,7 +50,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 set -euo pipefail
 
@@ -151,6 +151,13 @@ CI_USERNAME="Administrator"
 VIRTIO_ISO=""                 # --virtio-iso override
 CLOUDBASE_MSI=""              # --cloudbase-msi override
 SPICE_MSI=""                  # --spice-msi override
+
+# Operator addon directories (--addons/--addon, repeatable).  Each is a
+# directory of ordered addon sub-dirs; see the "Addons" section of the README
+# and validate_addons() for the addon.conf contract.  Never auto-downloaded —
+# the operator supplies every binary, the same stance as --iso.
+ADDONS_DIRS=()
+ADDON_SRC_DIRS=()             # absolute path of each resolved addon dir (validate_addons)
 
 CACHE_DIR=""                  # payload cache; default derived from ISO storage
 REFRESH_CACHE=0
@@ -745,6 +752,108 @@ stage_drivers() {
     ok "Staged $(ls -1 "${STAGE_DIR}/drivers" | wc -l) driver files ($(printf '%s ' "${VIRTIO_DRIVERS[@]}"))"
 }
 
+# --- Addons -------------------------------------------------------------------
+#
+# An "addon" is a directory holding an `addon.conf` (KEY=VALUE) plus the files
+# it references.  Build time installs the software; an optional first-boot
+# script (firstboot=) is baked into Cloudbase-Init's LocalScripts so it runs
+# once per clone with per-instance identity.  See the README "Addons" section.
+
+# Read one KEY from an addon.conf.  Ignores blanks/`#` comments, tolerates a
+# trailing CR, trims surrounding whitespace around the key, and returns the
+# raw value verbatim (so args= may contain spaces and '=').  Prints nothing
+# and returns 1 when the key is absent.
+addon_conf_get() {
+    local file="$1" key="$2" line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *=* ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        if [[ "$k" == "$key" ]]; then printf '%s' "$v"; return 0; fi
+    done < "$file"
+    return 1
+}
+
+# Resolve --addons/--addon into a flat, order-preserving list of addon dirs
+# and validate each against the addon.conf contract.  A value that itself
+# contains an addon.conf is treated as a single addon; otherwise it is a
+# collection directory whose immediate sub-dirs are addons (sorted by name so
+# the 10-/20-/30- prefix convention controls install order).  Binaries may be
+# legitimately absent on a --dry-run (the operator supplies them at build
+# time), so a missing referenced file is fatal only on a real run.
+validate_addons() {
+    (( ${#ADDONS_DIRS[@]} )) || return 0
+
+    local -A seen_names=()
+    local given abs sub name conf type file dest fb payload
+    for given in "${ADDONS_DIRS[@]}"; do
+        [[ -d "$given" ]] || die "--addons: not a directory: $given"
+        abs=$(cd "$given" && pwd) || die "--addons: cannot resolve: $given"
+
+        local -a addon_dirs=()
+        if [[ -f "${abs}/addon.conf" ]]; then
+            addon_dirs=( "$abs" )
+        else
+            while IFS= read -r sub; do addon_dirs+=( "$sub" ); done \
+                < <(find "$abs" -mindepth 1 -maxdepth 1 -type d | sort)
+            (( ${#addon_dirs[@]} )) || \
+                die "--addons: no addon.conf and no addon sub-dirs in: $given"
+        fi
+
+        for sub in "${addon_dirs[@]}"; do
+            name=$(basename "$sub")
+            conf="${sub}/addon.conf"
+            [[ -f "$conf" ]] || die "addon '${name}': missing addon.conf ($conf)"
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+                die "addon dir name '${name}' must be alphanumeric plus . _ - (it becomes a folder and, if firstboot=, a LocalScripts filename)"
+            [[ -n "${seen_names[$name]:-}" ]] && \
+                die "duplicate addon name '${name}' (addon dir names must be unique across all --addons)"
+            seen_names[$name]=1
+
+            type=$(addon_conf_get "$conf" type) || die "addon '${name}': addon.conf has no 'type='"
+            case "$type" in
+                msi|exe|script)
+                    file=$(addon_conf_get "$conf" file) || \
+                        die "addon '${name}': type=${type} requires 'file='"
+                    if [[ ! -f "${sub}/${file}" ]]; then
+                        if (( DRY_RUN )); then
+                            warn "addon '${name}': installer '${file}' not present yet (operator-supplied at build time)"
+                        else
+                            die "addon '${name}': installer not found: ${sub}/${file}"
+                        fi
+                    fi
+                    ;;
+                copy)
+                    dest=$(addon_conf_get "$conf" dest) || \
+                        die "addon '${name}': type=copy requires 'dest=' (a Windows path, e.g. C:\\Tools)"
+                    payload=$(addon_conf_get "$conf" payload) || payload="payload"
+                    if [[ ! -d "${sub}/${payload}" ]]; then
+                        if (( DRY_RUN )); then
+                            warn "addon '${name}': payload dir '${payload}/' not present yet (operator-supplied at build time)"
+                        else
+                            die "addon '${name}': payload directory not found: ${sub}/${payload}"
+                        fi
+                    fi
+                    ;;
+                *)
+                    die "addon '${name}': invalid type='${type}' (expected msi|exe|copy|script)"
+                    ;;
+            esac
+
+            if fb=$(addon_conf_get "$conf" firstboot) && [[ -n "$fb" ]]; then
+                [[ -f "${sub}/${fb}" ]] || \
+                    die "addon '${name}': firstboot script not found: ${sub}/${fb}"
+            fi
+
+            ADDON_SRC_DIRS+=( "$sub" )
+        done
+    done
+
+    ok "Validated ${#ADDON_SRC_DIRS[@]} addon(s): $(printf '%s ' "${ADDON_SRC_DIRS[@]##*/}")"
+}
+
 # Everything the guest needs, copied onto the answer ISO.  The build VM
 # never downloads anything.
 # A dry run never downloads, so the payloads may legitimately be absent —
@@ -775,6 +884,29 @@ stage_payloads() {
     stage_copy "$CLOUDBASE_MSI_PATH" "${STAGE_DIR}/pvebuild/CloudbaseInitSetup_x64.msi"
     stage_copy "$SPICE_MSI_PATH"     "${STAGE_DIR}/pvebuild/spice-vdagent-x64.msi"
     ok "Staged in-guest payloads (qemu-ga, virtio-win-gt, Cloudbase-Init, SPICE agent)"
+
+    stage_addons
+}
+
+# Copy every validated addon dir (addon.conf + binaries + optional firstboot
+# script) verbatim to pvebuild/addons/<name>/.  The whole tree rides onto the
+# answer ISO via build_answer_iso(); the guest's setup-complete.ps1 walks it in
+# sorted order.  On a dry run the binaries may not exist yet — report intent.
+stage_addons() {
+    (( ${#ADDON_SRC_DIRS[@]} )) || return 0
+
+    local src name dest
+    mkdir -p "${STAGE_DIR}/pvebuild/addons"
+    for src in "${ADDON_SRC_DIRS[@]}"; do
+        name=$(basename "$src")
+        dest="${STAGE_DIR}/pvebuild/addons/${name}"
+        if (( DRY_RUN )) && [[ ! -f "${src}/addon.conf" ]]; then
+            echo -e "   ${C_YELLOW}[dry-run]${C_RESET} stage addon ${name}"
+            continue
+        fi
+        cp -a "$src" "$dest"
+    done
+    ok "Staged ${#ADDON_SRC_DIRS[@]} addon(s): $(printf '%s ' "${ADDON_SRC_DIRS[@]##*/}")"
 }
 
 # The <ProductKey> block for the windowsPE pass.  Empty unless the operator
@@ -1118,7 +1250,13 @@ function Mark([string]$s) { Add-Content -LiteralPath $LOG -Value $s }
 # Returns the process exit code, or -1 if it had to be killed on timeout.
 function RunTimed([string]$file, [string[]]$argv, [int]$sec) {
     try {
-        $p = Start-Process -FilePath $file -ArgumentList $argv -PassThru -WindowStyle Hidden
+        # Start-Process rejects an empty -ArgumentList, so omit it when a
+        # command (e.g. an addon exe) takes no arguments.
+        if ($argv -and $argv.Count -gt 0) {
+            $p = Start-Process -FilePath $file -ArgumentList $argv -PassThru -WindowStyle Hidden
+        } else {
+            $p = Start-Process -FilePath $file -PassThru -WindowStyle Hidden
+        }
     } catch {
         return -2
     }
@@ -1283,6 +1421,118 @@ try {
 EOF
     fi
 
+    # Operator addons.  Always emitted (guarded on the staged dir), so the
+    # block is a clean no-op when no --addons were given.  Runs after the core
+    # payloads and Cloudbase-Init, before sysprep.  Reuses RunTimed/Mark and
+    # the $VirtioBaseline captured earlier so an addon that ships drivers can
+    # still be caught downgrading the virtio set.
+    cat >> "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
+
+$AddonRoot = Join-Path $PL 'addons'
+if (Test-Path -LiteralPath $AddonRoot) {
+    Mark 'ADDONS-STARTED'
+
+    function Get-AddonConf([string]$path) {
+        $h = @{}
+        foreach ($ln in Get-Content -LiteralPath $path) {
+            $ln = $ln.TrimEnd("`r")
+            if ($ln -match '^\s*#') { continue }
+            $eq = $ln.IndexOf('=')
+            if ($eq -lt 1) { continue }
+            $h[$ln.Substring(0, $eq).Trim()] = $ln.Substring($eq + 1)
+        }
+        return $h
+    }
+
+    $LocalScripts = Join-Path $env:ProgramFiles 'Cloudbase Solutions\Cloudbase-Init\LocalScripts'
+
+    Get-ChildItem -LiteralPath $AddonRoot -Directory | Sort-Object Name | ForEach-Object {
+        $ad = $_.FullName; $name = $_.Name
+        $conf = Join-Path $ad 'addon.conf'
+        if (-not (Test-Path -LiteralPath $conf)) { Mark "ADDON-$name-SKIP(no-conf)"; return }
+        $c = Get-AddonConf $conf
+
+        $type     = $c['type']
+        $timeout  = if ($c.ContainsKey('timeout') -and $c['timeout'].Trim()) { [int]$c['timeout'] } else { 600 }
+        $required = ($c['required'] -eq '1')
+        $codes    = if ($c.ContainsKey('codes') -and $c['codes'].Trim()) {
+                        @($c['codes'].Split(',') | ForEach-Object { [int]($_.Trim()) })
+                    } else { @(0, 3010) }
+        $extra    = @()
+        if ($c.ContainsKey('args') -and $c['args'].Trim()) { $extra = @($c['args'].Trim() -split '\s+') }
+
+        $rc = 0
+        switch ($type) {
+            'msi' {
+                $file = Join-Path $ad $c['file']
+                $rc = RunTimed 'msiexec.exe' (@('/i', $file, '/qn', '/norestart',
+                      '/l*v', (Join-Path $PL "addon-$name.log")) + $extra) $timeout
+            }
+            'exe' {
+                $rc = RunTimed (Join-Path $ad $c['file']) $extra $timeout
+            }
+            'script' {
+                $file = Join-Path $ad $c['file']
+                if ($file -match '\.ps1$') {
+                    $rc = RunTimed 'powershell.exe' (@('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                          '-File', $file) + $extra) $timeout
+                } else {
+                    $rc = RunTimed 'cmd.exe' (@('/c', $file) + $extra) $timeout
+                }
+            }
+            'copy' {
+                $dest = $c['dest']
+                $payload = Join-Path $ad $(if ($c.ContainsKey('payload') -and $c['payload'].Trim()) { $c['payload'] } else { 'payload' })
+                try {
+                    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Force -Path $dest | Out-Null }
+                    Copy-Item -Path (Join-Path $payload '*') -Destination $dest -Recurse -Force -ErrorAction Stop
+                    if ($c['path_add'] -eq '1') {
+                        $cur = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                        if (($cur -split ';') -notcontains $dest) {
+                            [Environment]::SetEnvironmentVariable('Path', ($cur.TrimEnd(';') + ';' + $dest), 'Machine')
+                        }
+                    }
+                    $rc = 0
+                } catch { $rc = -3 }
+            }
+            default { Mark "ADDON-$name-FAIL(bad-type:$type)"; return }
+        }
+
+        if ($codes -contains $rc) {
+            Mark "ADDON-$name-OK"
+        } elseif ($required) {
+            Mark "ADDON-$name-REQFAIL($rc)"
+        } else {
+            Mark "ADDON-$name-FAIL($rc)"
+        }
+
+        # Bake the optional first-boot init script into Cloudbase-Init's
+        # LocalScripts, so it runs once on each clone (new instance-id).
+        if ($c.ContainsKey('firstboot') -and $c['firstboot'].Trim()) {
+            $fb = Join-Path $ad $c['firstboot']
+            if (Test-Path -LiteralPath $fb) {
+                if (-not (Test-Path -LiteralPath $LocalScripts)) {
+                    New-Item -ItemType Directory -Force -Path $LocalScripts | Out-Null
+                }
+                Copy-Item -LiteralPath $fb -Destination (Join-Path $LocalScripts "$name-firstboot.ps1") -Force
+                Mark "ADDON-$name-FIRSTBOOT-BAKED"
+            } else {
+                Mark "ADDON-$name-FIRSTBOOT-MISS"
+            }
+        }
+    }
+
+    # An addon may ship its own virtio drivers and silently downgrade the set
+    # installed earlier; compared against the same baseline the core payloads
+    # use.  Emits the same VIRTIO-CHANGED marker the host already treats as fatal.
+    $VirtioAfterAddons = VirtioVersions
+    if ($VirtioBaseline -and $VirtioAfterAddons -ne $VirtioBaseline) {
+        Mark "VIRTIO-CHANGED(before=$VirtioBaseline,after=$VirtioAfterAddons)"
+    }
+    Mark 'ADDONS-DONE'
+}
+EOF
+
     cat >> "${STAGE_DIR}/pvebuild/setup-complete.ps1" <<'EOF'
 
 Mark 'INSTALLS-DONE'
@@ -1327,6 +1577,11 @@ del /f /q "%WINDIR%\Panther\unattend.xml" >nul 2>&1
 
 rem Keep state.txt and the *.log files for post-mortem; drop the installers.
 del /f /q "%PL%\*.msi" "%PL%\*.exe" "%PL%\*.conf" >nul 2>&1
+
+rem Drop the operator addon payloads: their first-boot scripts (if any) were
+rem already baked into Cloudbase-Init's LocalScripts, so the binaries must not
+rem ride along in every clone.
+if exist "%PL%\addons" rmdir /s /q "%PL%\addons" >nul 2>&1
 
 echo SYSPREP-LAUNCH >> "%LOG%"
 
@@ -1814,6 +2069,23 @@ check_payload_failures() {
         warn "The template is usable; clones lose SPICE clipboard sharing and display auto-resize."
         warn "Read C:\\pvebuild\\spice.log on the build disk with --keep-on-failure to diagnose"
     fi
+    # A required addon (required=1) that failed is fatal — the operator declared
+    # it must be present.  Advisory addon failures only warn: one bad optional
+    # addon must not throw away an otherwise-good template.
+    if grep -q '^ADDON-.*-REQFAIL' <<< "$GUEST_STATE"; then
+        local line
+        while IFS= read -r line; do
+            err "Required addon failed: ${line}"
+        done < <(grep '^ADDON-.*-REQFAIL' <<< "$GUEST_STATE")
+        die "A required addon (required=1) did not install. Its log is on the build disk under C:\\pvebuild\\addon-*.log — re-run with --keep-on-failure to read it."
+    fi
+    if grep -q '^ADDON-.*-FAIL' <<< "$GUEST_STATE"; then
+        local line
+        while IFS= read -r line; do
+            warn "Addon not installed (advisory): ${line}"
+        done < <(grep '^ADDON-.*-FAIL' <<< "$GUEST_STATE")
+        warn "The template is usable without these addons; read C:\\pvebuild\\addon-*.log with --keep-on-failure to diagnose"
+    fi
 }
 
 wait_for_shutdown() {
@@ -2006,6 +2278,8 @@ build_one() {
         IMAGE_NAME="Windows Server ${RELEASE} $(image_name_suffix "$SKU" "$edition")"
         warn "Media not present locally — showing the plan only"
         ok "Would install image: ${IMAGE_NAME}"
+        (( ${#ADDON_SRC_DIRS[@]} )) && \
+            ok "Would stage ${#ADDON_SRC_DIRS[@]} addon(s): $(printf '%s ' "${ADDON_SRC_DIRS[@]##*/}")"
         ANSWER_ISO_PATH="${ISO_DIR}/pve-answer-${BUILD_ID}-${CURRENT_EDITION}.iso"
         create_build_vm "$vmid"
         echo -e "   ${C_YELLOW}[dry-run]${C_RESET} qm start ${vmid}"
@@ -2198,6 +2472,18 @@ delegate_to_server() {
         rcmd+=( --admin-password-file "${rdir}/admin.pw" )
     fi
 
+    # Addons: copy each validated addon dir into one remote collection dir and
+    # point the remote run at it.  ADDON_SRC_DIRS was populated by
+    # validate_addons() before delegation, so the names are already unique.
+    if (( ${#ADDON_SRC_DIRS[@]} )); then
+        ssh "${ssh_opts[@]}" "$PVE_SERVER" "mkdir -p ${rdir}/addons"
+        local a
+        for a in "${ADDON_SRC_DIRS[@]}"; do
+            scp -qr "${ssh_opts[@]}" "$a" "${PVE_SERVER}:${rdir}/addons/"
+        done
+        rcmd+=( --addons "${rdir}/addons" )
+    fi
+
     local -a tty_flag=()
     [[ -t 1 ]] && tty_flag=( -t )
 
@@ -2235,6 +2521,14 @@ ${C_BOLD}Media${C_RESET} (Windows media is never downloaded unless you ask for -
       --virtio-iso PATH    Use this virtio-win ISO instead of downloading
       --cloudbase-msi PATH Use this Cloudbase-Init MSI instead of downloading
       --spice-msi PATH     Use this SPICE vdagent MSI instead of downloading
+
+${C_BOLD}Addons (extra software; repeatable):${C_RESET}
+      --addons DIR         Install operator-supplied software into the template.
+      --addon DIR          DIR is an addon (has addon.conf) or a directory of
+                           addon sub-dirs run in sorted order.  Each addon.conf
+                           declares type=msi|exe|copy|script and, optionally,
+                           firstboot=SCRIPT to run once per clone with the VM's
+                           own identity.  See samples/addons and the README.
 
 ${C_BOLD}What to build:${C_RESET}
   -e, --edition WHICH      core|desktop|both                        [both]
@@ -2338,6 +2632,7 @@ main() {
             --virtio-iso)          VIRTIO_ISO="$2";          shift 2 ;;
             --cloudbase-msi)       CLOUDBASE_MSI="$2";       shift 2 ;;
             --spice-msi)           SPICE_MSI="$2";           shift 2 ;;
+            --addons|--addon)      ADDONS_DIRS+=( "$2" );    shift 2 ;;
             # --- what to build ---
             -e|--edition)          EDITION="$2";             shift 2 ;;
             -k|--sku)              SKU="$2";                 shift 2 ;;
@@ -2442,6 +2737,10 @@ main() {
     # INPUT_LOCALE is resolved in probe_windows_iso(), once the media's own
     # language is known.
     [[ -z "$BUILD_BRIDGE" ]] && BUILD_BRIDGE="$BRIDGE"
+
+    # Resolve and validate addon dirs before anything expensive, and before a
+    # remote delegation copies them to the node.
+    validate_addons
 
     (( DRY_RUN )) && echo -e "\n${C_YELLOW}=== DRY RUN ===${C_RESET}\n"
 

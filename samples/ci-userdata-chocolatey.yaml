@@ -1,0 +1,53 @@
+#ps1_sysnative
+# Clone-time package install on WINDOWS via Chocolatey and Cloudbase-Init.
+#
+# This is the per-VM, NOT-baked-into-the-template route the way an addon's
+# firstboot script is baked in. Use it when packages should be chosen per clone
+# rather than shipped in the golden image (issue #2's "package managers like
+# chocolatey ... via Cloudbase-Init" idea).
+#
+# Cloudbase-Init's UserDataPlugin runs this script on first boot. The
+# "#ps1_sysnative" shebang tells Cloudbase-Init to execute it as a native
+# 64-bit PowerShell script. Templates built by pve-build-windows-template have
+# UserDataPlugin enabled, so no template change is needed.
+#
+# Apply it per VM as cloud-init user-data. On PVE, user-data goes through a
+# custom snippet on a snippets-enabled storage:
+#
+#   qm set <vmid> --cicustom "user=local:snippets/ci-userdata-chocolatey.ps1"
+#
+# (PVE reads the file verbatim; the ".yaml" extension here is only so it sits
+# beside the other samples. Save it as .ps1 on the snippets storage.)
+#
+# NOTE: user-data REPLACES PVE's auto-generated user-data. Set the hostname /
+# users / network you need explicitly, or drive those through Cloudbase-Init's
+# metadata plugins instead and keep user-data for packages only.
+
+$ErrorActionPreference = 'Continue'
+$log = 'C:\ProgramData\pve-addons\choco-userdata.log'
+New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
+function Log($m) { Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format s), $m) }
+
+# Per-VM package list. Edit this per clone (that is the whole point of doing it
+# at clone time rather than baking it into the template).
+$packages = @('7zip', 'notepadplusplus', 'git')
+
+# Install Chocolatey if it is not already present.
+if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+    Log 'installing Chocolatey'
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    [System.Net.ServicePointManager]::SecurityProtocol = 3072   # TLS 1.2
+    try {
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+    } catch {
+        Log ("Chocolatey bootstrap failed: " + $_.Exception.Message)
+        return
+    }
+}
+
+$choco = Join-Path $env:ProgramData 'chocolatey\bin\choco.exe'
+foreach ($p in $packages) {
+    Log "installing $p"
+    & $choco install $p -y --no-progress 2>&1 | ForEach-Object { Log $_ }
+}
+Log 'done'

@@ -1,0 +1,3 @@
+# Extract the Sysinternals Suite here. Files in this directory are copied to the
+# addon's `dest` at build time. This .gitkeep only keeps the empty dir tracked;
+# the binaries are operator-supplied and must not be committed.
