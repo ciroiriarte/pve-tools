@@ -1,3 +1,23 @@
+pve-tools (1.13.0-1) unstable; urgency=medium
+
+  * pve-build-windows-template 1.5.0: add an addon facility for installing
+    extra software into Windows templates. --addons / --addon stage
+    operator-supplied installers onto the answer ISO; each addon.conf declares
+    a type (msi, exe, copy or script) that runs in the build VM after the core
+    payloads and before sysprep. An addon may also ship an optional firstboot
+    script, which is baked into Cloudbase-Init's LocalScripts and runs once per
+    clone so software needing a per-instance identity (an AV or inventory agent
+    enrolling with its own name/token) initialises itself at deployment time.
+    Binaries are never downloaded or bundled: the operator supplies them, the
+    same stance as --iso, and in remote mode the addon directories are copied
+    to the node. A required=1 addon aborts the build on failure; the default is
+    advisory. Ships worked examples under samples/addons (7-Zip silent MSI,
+    Sysinternals file-copy with PATH, and a two-phase Wazuh agent that enrols
+    per clone) plus samples/ci-userdata-chocolatey.yaml for the clone-time
+    package-manager route via Cloudbase-Init user-data.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 06 Aug 2026 10:45:00 -0300
+
 pve-tools (1.12.1-1) unstable; urgency=medium
 
   * pve-build-windows-template 1.4.0: put the locale in the template name.
