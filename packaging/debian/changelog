@@ -1,3 +1,21 @@
+pve-tools (1.12.1-1) unstable; urgency=medium
+
+  * pve-build-windows-template 1.4.0: put the locale in the template name.
+    The name was ci-win<release>-<sku>-<edition>-<timestamp>, so two
+    localisations of the same release, SKU and edition were separated only
+    by the timestamp, which has minute resolution and is taken once per
+    run. Concurrent builds therefore collided outright: a 2019 en-US and a
+    2019 ja-JP build started seconds apart both sealed as
+    ci-win2019-std-core-202608051606.x86-64. Names are now
+    ci-win2025-std-core-ja-jp-202608051603.x86-64, with the locale
+    lowercased so the name remains a valid DNS label. Existing templates
+    keep their old names; only new builds are affected.
+  * pve-build-windows-template: record the locale and keyboard layout in
+    the template description, which already listed the release, WIM image,
+    source ISO and payload versions but not the language.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 05 Aug 2026 19:30:00 -0300
+
 pve-tools (1.12.0-1) unstable; urgency=medium
 
   * New tool:
