@@ -1,7 +1,7 @@
 .\" pve-build-windows-template - Build sysprepped Windows Server templates on Proxmox VE
 .\" Copyright (c) 2024-2026 Ciro Iriarte
 .\" SPDX-License-Identifier: MIT
-.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-05" "1.3.0" "Proxmox VE Tools"
+.TH PVE\-BUILD\-WINDOWS\-TEMPLATE 8 "2026-08-05" "1.4.0" "Proxmox VE Tools"
 
 .SH NAME
 pve\-build\-windows\-template \- build sysprepped, cloud\-init\-capable Windows Server templates on Proxmox VE
@@ -316,6 +316,21 @@ Show usage.
 .BR \-v ", " \-\-version
 Print the script version.
 
+.SH TEMPLATE NAMING
+Sealed templates are named
+.IP
+.EX
+ci\-win<release>\-<std|dc>\-<core|desktop>\-<locale>\-<timestamp>.x86\-64
+.EE
+.PP
+for example
+.IR ci\-win2025\-std\-core\-ja\-jp\-202608051603.x86\-64 .
+The locale is lowercased so the name stays a valid DNS label, which PVE
+requires. It is part of the name because without it two localisations of the
+same release, SKU and edition are distinguished only by the timestamp, which
+has minute resolution and is taken once per run: two builds starting in the
+same minute would produce identical names. The locale is also recorded in the
+template description.
 .SH LANGUAGE SUPPORT
 Any Windows Server localisation is supported with no extra arguments.
 .PP

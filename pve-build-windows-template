@@ -50,7 +50,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 set -euo pipefail
 
@@ -1934,6 +1934,7 @@ Built by pve-build-windows-template ${VERSION} on $(hostname) at $(date -Is)
   Release        : Windows Server ${RELEASE} ($( (( IS_EVAL_MEDIA )) && echo evaluation || echo licensed ) media)
   SKU / edition  : ${SKU} / ${CURRENT_EDITION}
   WIM image      : ${IMAGE_NAME}
+  Locale         : ${LOCALE} (keyboard ${INPUT_LOCALE})
   Source ISO     : $(basename "$WIN_ISO_PATH")
   virtio-win     : ${VIRTIO_VERSION}
   Cloudbase-Init : $(basename "$CLOUDBASE_MSI_PATH")
@@ -2109,15 +2110,23 @@ build_one() {
     rm -rf "$STAGE_DIR"; STAGE_DIR=""
 }
 
-# ci-win2022-std-core-202608011530.x86-64 — matches the existing ci-* naming
-# and is a valid DNS label (PVE VM names must be).
+# ci-win2022-std-core-en-us-202608011530.x86-64 — matches the existing ci-*
+# naming and is a valid DNS label (PVE VM names must be), so the locale is
+# lowercased.
+#
+# The locale is part of the name because without it the only thing telling two
+# localisations apart is TIMESTAMP, which has minute resolution and is taken
+# once per run: two concurrent runs of the same release, SKU and edition that
+# start in the same minute produce byte-identical template names.  That is not
+# hypothetical -- a 2019 en-US rebuild and a 2019 ja-JP build launched seconds
+# apart both came out as ci-win2019-std-core-202608051606.x86-64.
 template_name() {
     local edition="$1" sku_short
     case "$SKU" in
         standard)   sku_short="std" ;;
         datacenter) sku_short="dc"  ;;
     esac
-    echo "ci-win${RELEASE}-${sku_short}-${edition}-${TIMESTAMP}.x86-64"
+    echo "ci-win${RELEASE}-${sku_short}-${edition}-${LOCALE,,}-${TIMESTAMP}.x86-64"
 }
 
 # --- Remote mode (delegation) -------------------------------------------------

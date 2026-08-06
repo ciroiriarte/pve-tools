@@ -395,6 +395,8 @@ pve-build-windows-template --iso dstore01:iso/win2022.iso --storage dstore01 --d
 
 Everything installed in the guest — virtio drivers, QEMU guest agent, SPICE agent and Cloudbase-Init — is staged from the host onto the answer ISO. The build VM never downloads anything, so an air-gapped node builds exactly the same template as a connected one.
 
+**Template naming:** `ci-win<release>-<std|dc>-<core|desktop>-<locale>-<timestamp>.x86-64`, for example `ci-win2025-std-core-ja-jp-202608051603.x86-64`. The locale is part of the name because without it two localisations of the same release, SKU and edition differ only by `<timestamp>`, which has minute resolution and is taken once per run — so two builds started in the same minute produce identical names. The locale is also recorded in the template description alongside the release, WIM image, source ISO and payload versions.
+
 Remote Desktop is enabled with its firewall rule as part of step 5 (`--no-rdp` to skip). Each in-guest installer runs under its own timeout, so a hung installer degrades to a warning instead of stalling the build; progress is reported live from the guest through the QEMU agent.
 
 ### Cloud-init on Windows
