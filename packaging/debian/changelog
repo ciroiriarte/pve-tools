@@ -1,3 +1,16 @@
+pve-tools (1.14.0-1) unstable; urgency=medium
+
+  * pve-import-cloud-images 1.5.0: add --max-versions and per-release pinning.
+    -N/--max-versions exposes the discovery limit (how many releases each
+    distribution family offers, default 2) so older releases beyond the two
+    newest can be surfaced. -r/--release pins specific release(s),
+    comma-separated (e.g. 22.04 or 22.04,20.04): it widens discovery so the
+    requested version is not truncated away, then filters the catalog to the
+    matching versions. Tokens match on version boundaries, so '10' matches
+    point releases like 10.0. Combine with --distro to target one family.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 14 Aug 2026 12:16:40 -0300
+
 pve-tools (1.13.0-1) unstable; urgency=medium
 
   * pve-build-windows-template 1.5.0: add an addon facility for installing
