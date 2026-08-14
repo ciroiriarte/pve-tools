@@ -23,7 +23,7 @@ set -euo pipefail
 #
 # Reference: https://iriarte.it/datacenter/2025/02/13/PVE-Cloud-Images.html
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 # --- Colors (disabled when stdout is not a terminal) --------------------------
 if [[ -t 1 ]]; then
@@ -80,6 +80,8 @@ CUSTOMIZE=1
 MODE=""
 DISTRO_FILTER=""
 MAX_VERSIONS=2
+MAX_VERSIONS_SET=0   # track whether --max-versions was explicitly provided
+VERSION_PIN=""       # comma-separated release pins (e.g. "22.04" or "22.04,20.04")
 ARCH="x86_64"
 TIMESTAMP=$(date +%Y%m%d%H%M)
 
@@ -124,6 +126,23 @@ fetch_page() {
 # Extract href values from HTML, one per line, trailing slashes stripped
 extract_hrefs() {
     grep -o 'href="[^"]*"' | sed 's/href="//;s/"$//;s|/$||;s|^\./||'
+}
+
+# Return 0 if $1 (an image NAME) matches any pinned release token in
+# VERSION_PIN (comma-separated).  Tokens match on numeric boundaries, so
+# "10" matches "Rocky Linux 10.0" and "22.04" matches "Ubuntu 22.04 LTS".
+# Always matches when no pin is set.
+version_matches() {
+    local haystack="$1" token re
+    [[ -z "$VERSION_PIN" ]] && return 0
+    local IFS=','
+    for token in $VERSION_PIN; do
+        token="${token//[[:space:]]/}"
+        [[ -n "$token" ]] || continue
+        re="${token//./\\.}"   # escape dots for the regex below
+        [[ "$haystack" =~ (^|[^0-9])${re}([^0-9]|$) ]] && return 0
+    done
+    return 1
 }
 
 # --- Mirror discovery functions -----------------------------------------------
@@ -376,6 +395,7 @@ build_catalog() {
             local count=0
             while IFS='|' read -r key name url fam customize; do
                 [[ -n "$url" ]] || continue
+                version_matches "$name" || continue
                 _reg "$key" "$name" "$url" "$fam" "$customize"
                 (( count++ )) || true
             done < "$DISCOVERY_TMPDIR/$family"
@@ -1175,6 +1195,12 @@ Options:
   -S, --disk-size SIZE  Resize boot disk (e.g. 60G; default: keep original)
   -I, --start-id ID     Starting VM ID (default: 9000)
   -d, --distro NAME     Filter by family: debian ubuntu rocky opensuse oracle freebsd
+  -N, --max-versions N  Releases per family to offer (default: $MAX_VERSIONS)
+  -r, --release VER     Pin specific release(s), comma-separated (e.g. 22.04
+                        or 22.04,20.04). Widens discovery, then keeps only the
+                        matching versions. Combine with --distro to target one
+                        family. Tokens match on version boundaries, so '10'
+                        matches point releases like 10.0.
   -c, --cpu-type TYPE   Template CPU model (default: auto). 'auto' picks a
                         migration-safe x86-64 baseline matched to the guest
                         (EL10+ → x86-64-v3, else x86-64-v2-AES). Pass an explicit
@@ -1203,6 +1229,8 @@ Examples:
   $(basename "$0") -m local -i            Interactive selection
   $(basename "$0") -m local -b            Import all discovered images
   $(basename "$0") -m local -b -d debian  Debian images only
+  $(basename "$0") -m local -i -d ubuntu -N 3     Offer 3 newest Ubuntu LTS
+  $(basename "$0") -m local -b -d ubuntu -r 22.04 Pin Ubuntu 22.04 only
   $(basename "$0") -m local -b -s pool    Use specific storage backend
   $(basename "$0") -m local -b -S 60G     Resize disks to 60G
   $(basename "$0") -m local -n -b         Dry run, all images
@@ -1231,6 +1259,8 @@ main() {
             --disk-size|-S)    DISK_SIZE="$2"; shift 2 ;;
             --start-id|-I)     START_ID="$2"; shift 2 ;;
             --distro|-d)       DISTRO_FILTER="$2"; shift 2 ;;
+            --max-versions|-N) MAX_VERSIONS="$2"; MAX_VERSIONS_SET=1; shift 2 ;;
+            --release|-r)      VERSION_PIN="$2"; shift 2 ;;
             --cpu-type|-c)     CPU_TYPE="$2"; shift 2 ;;
             --force)           FORCE=1; shift ;;
             --no-customize)    CUSTOMIZE=0; shift ;;
@@ -1263,6 +1293,22 @@ main() {
             debian|ubuntu|rocky|opensuse|oracle|freebsd) ;;
             *) err "Unknown distro family: $DISTRO_FILTER"; exit 1 ;;
         esac
+    fi
+
+    # Validate max-versions
+    if [[ ! "$MAX_VERSIONS" =~ ^[0-9]+$ ]] || (( MAX_VERSIONS < 1 )); then
+        err "--max-versions must be a positive integer"
+        exit 1
+    fi
+
+    # When pinning specific releases, widen discovery so the requested
+    # version isn't truncated before the version filter runs.  An explicit
+    # --max-versions is honored if it's already large enough.
+    if [[ -n "$VERSION_PIN" ]] && (( MAX_VERSIONS < 99 )); then
+        if (( MAX_VERSIONS_SET )); then
+            warn "--release given: widening discovery to find pinned version(s)"
+        fi
+        MAX_VERSIONS=99
     fi
 
     # Validate architecture
