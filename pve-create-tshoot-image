@@ -52,19 +52,21 @@
 #
 # See --help for full usage.
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 set -euo pipefail
 
 # --- Colours (disabled when stdout is not a terminal) -------------------------
 
 if [[ -t 1 ]]; then
-    C_RED='\033[0;31m'
-    C_GREEN='\033[0;32m'
-    C_YELLOW='\033[0;33m'
-    C_CYAN='\033[0;36m'
-    C_BOLD='\033[1m'
-    C_RESET='\033[0m'
+    # ANSI-C quoting ($'...') embeds real ESC bytes so the sequences render in
+    # both `echo -e` helpers and plain `cat` heredocs (e.g. usage()).
+    C_RED=$'\033[0;31m'
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[0;33m'
+    C_CYAN=$'\033[0;36m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
 else
     C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
 fi
