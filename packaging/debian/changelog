@@ -1,3 +1,23 @@
+pve-tools (1.15.0-1) unstable; urgency=medium
+
+  * pve-create-tshoot-image 1.4.1: support Ceph/RBD-backed templates and
+    honour -s/--storage. The offline libguestfs steps (virt-cat,
+    virt-customize, virt-copy-out) were handed the raw `pvesm path` result,
+    which for Ceph is a QEMU rbd: drive string libguestfs cannot open, so
+    distro detection failed with a misleading "is this a Linux template?".
+    A new disk_open/disk_close layer maps the RBD image to a /dev/rbdN block
+    device for each offline step and unmaps it afterwards (the cleanup trap
+    releases it on any exit path); file-based storage is used verbatim.
+    qm clone now passes --storage, so -s is actually honoured instead of
+    silently inheriting the template's storage — the two compose, with
+    -s local cloning onto file storage read directly and a Ceph pool
+    triggering the mapping. rbd map failures now surface their real error
+    instead of being swallowed, and the --help output no longer prints raw
+    escape sequences (colours use ANSI-C quoting so they render through cat
+    heredocs as well as echo -e).
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 19 Aug 2026 12:55:14 -0500
+
 pve-tools (1.14.0-1) unstable; urgency=medium
 
   * pve-import-cloud-images 1.5.0: add --max-versions and per-release pinning.
