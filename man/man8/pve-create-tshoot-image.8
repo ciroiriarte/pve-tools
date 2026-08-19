@@ -207,6 +207,10 @@ HTTP/HTTPS proxy for the build VM.
 .TP
 .BR \-s ", " \-\-storage " " \fISTORE\fR
 PVE storage for the temporary VM disk.
+The template is full\-cloned onto this storage, so it may differ from the
+template's own storage.
+Both file\-based storage (\fBlocal\fR, \fBdir\fR, LVM\-thin, ZFS) and Ceph/RBD
+storage are supported.
 Default:
 .BR local\-lvm .
 .TP
@@ -340,7 +344,10 @@ Failure (missing dependencies, build error, etc.).
 .BR virt\-customize (1),
 .BR virt\-cat (1),
 .BR virt\-copy\-out (1),
-.BR python3 (1).
+.BR python3 (1),
+.BR rbd (8)
+(only when the temporary VM disk lives on Ceph/RBD storage; from
+.BR ceph\-common ).
 .SS Remote mode
 .BR ssh (1),
 .BR scp (1).

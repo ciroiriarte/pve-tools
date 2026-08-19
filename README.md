@@ -195,6 +195,8 @@ The ISO boots into a rescue environment pre-loaded with network diagnostic tools
 
 In remote mode the script copies itself and the CSV to the PVE node, builds the ISO there, then downloads it back to the jump host.
 
+**Storage:** the template is full-cloned onto the storage given with `-s/--storage` (default `local-lvm`), so it can differ from the template's own storage. Both file-based storage (`local`, `dir`, LVM-thin, ZFS — anything `pvesm path` resolves to a file or block device) and **Ceph/RBD** are supported; for RBD the temporary disk is mapped to a `/dev/rbdN` block device for each offline `libguestfs` step and unmapped afterwards (requires `rbd` from `ceph-common`).
+
 **On boot the ISO will:**
 
 1. Read the system serial number → set hostname and management IP from CSV
@@ -276,14 +278,14 @@ All VM interaction uses the QEMU guest agent (virtio serial channel) — no netw
 
 **Workflow:**
 
-1. Clone the specified PVE template to a temporary VM (full clone)
+1. Clone the specified PVE template to a temporary VM (full clone onto `-s/--storage`)
 2. Detect the distribution from the disk image (`/etc/os-release`)
 3. Resize disk (+10G), inject config files via `virt-customize`, wipe host identity, enable guest-exec
 4. Boot the VM (cloud-init grows the filesystem), install packages via QEMU guest agent
 5. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`) via guest agent
 6. Stop the VM, extract the ISO via `virt-copy-out`, destroy the temporary VM
 
-**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `virt-copy-out`, `python3`.
+**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `virt-copy-out`, `python3`. Plus `rbd` (`ceph-common`) when the temporary VM disk is on Ceph/RBD storage.
 
 **Dependencies (remote mode):** `ssh` and `scp` only (PVE tools are used on the remote node).
 
