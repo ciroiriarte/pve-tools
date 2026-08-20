@@ -18,7 +18,6 @@ Description: Operational scripts for Proxmox VE clusters
     dynamically discovering the latest releases from distribution mirrors.
   * pve-vmnic-fix — repair VM/CT network bridges after host network changes
     (pending-config apply, networking restart, or SDN reload).
-  * pve-create-tshoot-image — build a ReaR troubleshooting / restore ISO.
   * pve-sdn-healthcheck — validate the SDN network layer (underlay + overlay).
   * pve-rolling-upgrade — rolling, health-gated PVE 8->9 upgrade of one node
     (live-migrate guests off, dist-upgrade, pin NICs, reboot, gate on health).

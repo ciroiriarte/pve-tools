@@ -1,3 +1,17 @@
+pve-tools (2.0.0-1) unstable; urgency=medium
+
+  * Drop the troubleshooting-image tooling from pve-tools (backward-incompatible
+    removal, hence the major version bump):
+    - Remove pve-create-tshoot-image (the ReaR-based restore-ISO builder).
+    - pve-create-tshoot-livecd moves to the obs-network-tools repository as
+      create-network-tshoot-livecd — a distro-independent, boot-only cabling
+      diagnostics LiveCD built with live-build instead of a PVE cloud-init
+      template. It no longer belongs in the Proxmox-specific toolset.
+    Both tools did physical-host cabling diagnostics and are better maintained
+    alongside the network-tools packaging pipeline (nic-xray, switch-xray).
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 19 Aug 2026 19:51:07 -0500
+
 pve-tools (1.15.0-1) unstable; urgency=medium
 
   * pve-create-tshoot-image 1.4.1: support Ceph/RBD-backed templates and

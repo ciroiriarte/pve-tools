@@ -7,7 +7,6 @@ Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-
 - [pve-import-cloud-images](#pve-import-cloud-images) - Import upstream cloud images as PVE templates
   - [Cloud-init usage](cloud-init-usage.md) - Provisioning examples and sample snippets
 - [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
-- [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
 - [pve-build-windows-template](#pve-build-windows-template) - Build sysprepped Windows Server templates unattended
 - [pve-sdn-healthcheck](#pve-sdn-healthcheck) - Validate the SDN network layer (underlay + overlay)
 - [pve-rolling-upgrade](#pve-rolling-upgrade) - Rolling, health-gated PVE 8→9 upgrade of one node
@@ -177,117 +176,6 @@ Reports per-interface status and prints a summary:
    [+] net0 OK
 :: Done. 1 guest(s), 1 interface(s) checked, 0 repaired.
 ```
-
----
-
-## pve-create-tshoot-image
-
-Build a [ReaR](https://relax-and-recover.org/) troubleshooting / restore ISO from a PVE cloud-init template.
-
-The ISO boots into a rescue environment pre-loaded with network diagnostic tools. It identifies the physical host via DMI serial number and applies per-host identity (hostname + IP) from a CSV inventory.
-
-**Modes of operation:**
-
-| Mode | Where to run | ISO destination | Requirements |
-|---|---|---|---|
-| **Local** | Directly on a PVE node (as root) | PVE node filesystem | PVE tools + libguestfs + python3 |
-| **Remote** | From a jump host (`-S user@host`) | Jump host filesystem | `ssh` + `scp` only |
-
-In remote mode the script copies itself and the CSV to the PVE node, builds the ISO there, then downloads it back to the jump host.
-
-**Storage:** the template is full-cloned onto the storage given with `-s/--storage` (default `local-lvm`), so it can differ from the template's own storage. Both file-based storage (`local`, `dir`, LVM-thin, ZFS — anything `pvesm path` resolves to a file or block device) and **Ceph/RBD** are supported; for RBD the temporary disk is mapped to a `/dev/rbdN` block device for each offline `libguestfs` step and unmapped afterwards (requires `rbd` from `ceph-common`).
-
-**On boot the ISO will:**
-
-1. Read the system serial number → set hostname and management IP from CSV
-2. Bring up **every** physical NIC and start lldpd for neighbour discovery (unconditional — runs even without IP configuration)
-3. (Optional) Configure a bonded VLAN management interface with per-host IP
-4. Present `tcpdump`, `nic-xray` and `lldpcli` for network diagnostics
-5. Offer `rear recover` to deploy the base OS to local disks
-
-The build VM is an intermediate state — host identity files (`machine-id`, SSH host keys, `random-seed`) are wiped so each restored system is unique.
-
-**Supported distributions:**
-
-| Family | Package manager | Extras |
-|---|---|---|
-| Rocky Linux (8, 9) | dnf + EPEL | nic-xray from OBS |
-| Ubuntu LTS (22.04, 24.04) | apt | nic-xray from OBS |
-| openSUSE Leap (15.x, 16.x) | zypper | nic-xray from OBS |
-
-**Usage:**
-
-```bash
-# Local mode — run on a PVE node, ISO saved to current directory
-pve-create-tshoot-image -t 9000 -c hosts.csv
-
-# Local mode — ISO to a specific directory
-pve-create-tshoot-image -t 9000 -c hosts.csv -o /var/tmp/iso/
-
-# Remote mode — build on a PVE node, ISO downloaded to jump host
-pve-create-tshoot-image -t 9000 -c hosts.csv -S root@pve1.example.com
-
-# With VLAN management network (either mode)
-pve-create-tshoot-image -t 9000 -c hosts.csv \
-    --vlan-id 100 --netmask /24 --gateway 10.0.0.1 --dns 8.8.8.8
-
-# Build VM on a different VLAN with HTTP proxy
-pve-create-tshoot-image -t 9000 -c hosts.csv \
-    --vm-vlan 302 --vm-proxy http://proxy:3128
-
-# Rescue-only (smaller ISO, no backup)
-pve-create-tshoot-image -t 9000 -c hosts.csv --rescue-only
-```
-
-**CSV file** (host inventory — serial, hostname, bond members, management IP):
-
-```csv
-# serial,hostname,bond_members,ip
-SVR001,web-server-01,eth0:eth1,10.0.0.11
-SVR002,db-server-01,eno1:eno2,10.0.0.12
-SVR003,app-server-01,ens1f0:ens1f1,10.0.0.13
-```
-
-Bond members use `:` as separator to allow for different hardware across servers.
-
-**Target-host network** (CLI parameters, shared across all hosts):
-
-| Parameter | Description | Default |
-|---|---|---|
-| `--bond-mode` | Bonding mode | `802.3ad` |
-| `--vlan-id` | Management VLAN ID | *(no VLAN)* |
-| `--netmask` | Network mask (e.g. `/24`) | *(required with --gateway/--dns)* |
-| `--gateway` | Default gateway | *(required with --netmask/--dns)* |
-| `--dns` | Comma-separated DNS servers | *(required with --netmask/--gateway)* |
-| `--proxy` | HTTP/HTTPS proxy for restored hosts | *(optional)* |
-
-Per-host IP and bond members come from the CSV (allowing different hardware per server). The shared parameters above define how the management interface is constructed (bond → VLAN → IP assignment).
-
-**Build-VM network** (used only during image preparation):
-
-| Parameter | Description | Default |
-|---|---|---|
-| `--vm-bridge` | PVE bridge | `vmbr0` |
-| `--vm-vlan` | VLAN tag on the build VM NIC | *(none)* |
-| `--vm-ip` | Build VM IP (`dhcp` or `IP/MASK`) | `dhcp` |
-| `--vm-gateway` | Gateway (required if static) | |
-| `--vm-dns` | DNS (optional for static) | |
-| `--vm-proxy` | HTTP/HTTPS proxy for build VM | *(optional)* |
-
-All VM interaction uses the QEMU guest agent (virtio serial channel) — no network connectivity is required between the PVE host and the build VM.  This allows building on any VLAN regardless of L3 routing.
-
-**Workflow:**
-
-1. Clone the specified PVE template to a temporary VM (full clone onto `-s/--storage`)
-2. Detect the distribution from the disk image (`/etc/os-release`)
-3. Resize disk (+10G), inject config files via `virt-customize`, wipe host identity, enable guest-exec
-4. Boot the VM (cloud-init grows the filesystem), install packages via QEMU guest agent
-5. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`) via guest agent
-6. Stop the VM, extract the ISO via `virt-copy-out`, destroy the temporary VM
-
-**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `virt-copy-out`, `python3`. Plus `rbd` (`ceph-common`) when the temporary VM disk is on Ceph/RBD storage.
-
-**Dependencies (remote mode):** `ssh` and `scp` only (PVE tools are used on the remote node).
 
 ---
 
@@ -667,7 +555,7 @@ echo "deb [signed-by=/usr/share/keyrings/pve-tools.gpg] $REPO/ /" \
 apt update && apt install pve-tools
 ```
 
-This installs the seven scripts to `/usr/sbin`, their man pages to
+This installs the six scripts to `/usr/sbin`, their man pages to
 `/usr/share/man/man8`, and the bash completion to
 `/usr/share/bash-completion/completions`. Updates then arrive with the usual
 `apt upgrade`. To install a single `.deb` without adding the repo, download it
@@ -679,7 +567,7 @@ from the `Debian_12/all/` (or `Debian_13/all/`) directory and run
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade pve-build-windows-template /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-sdn-healthcheck pve-rolling-upgrade pve-ceph-upgrade pve-build-windows-template /usr/local/sbin/
 ```
 
 Man pages are provided in `man/man8/`. To install them:

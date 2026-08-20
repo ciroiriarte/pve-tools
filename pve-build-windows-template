@@ -2406,7 +2406,7 @@ template_name() {
 # --- Remote mode (delegation) -------------------------------------------------
 
 # Copy the script to the target PVE node and re-execute it there in local
-# mode.  Unlike pve-create-tshoot-image nothing is downloaded back — the
+# mode.  Nothing is downloaded back — the
 # template stays on the node.  Secrets travel as mode-0600 files so they
 # never appear in the remote process table.
 delegate_to_server() {
